@@ -15,8 +15,12 @@ import { inlineCopilot } from 'codemirror-copilot';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { hyperLink } from '@uiw/codemirror-extensions-hyper-link';
-import { langs } from '@uiw/codemirror-extensions-langs';
 import { useAtomValue, useSetAtom, useStore } from 'jotai';
+import { useBAMLSDK } from '../../../sdk/hooks';
+// Import specific language support instead of all languages
+import { javascript as jsLang } from '@codemirror/lang-javascript';
+import { python as pythonLang } from '@codemirror/lang-python';
+import { json as jsonLang } from '@codemirror/lang-json';
 import type { ICodeBlock } from '../types';
 import { CodeMirrorDiagnosticsAtom } from './atoms';
 
@@ -37,14 +41,14 @@ import {
 // } from '@typescript/vfs';
 import { useTheme } from 'next-themes';
 import ts from 'typescript';
-import { flashRangesAtom, updateCursorAtom } from '../playground-panel/atoms';
+import { flashRangesAtom } from '../playground-panel/atoms';
 
 const extensionMap = {
-  js: [langs.javascript()],
-  jsx: [langs.jsx()],
-  py: [langs.python()],
-  python: [langs.python()],
-  json: [langs.json()],
+  js: [jsLang()],
+  jsx: [jsLang({ jsx: true })],
+  py: [pythonLang()],
+  python: [pythonLang()],
+  json: [jsonLang()],
   baml: [BAML()],
 };
 
@@ -58,12 +62,9 @@ const clearFlashingEffect = StateEffect.define<void>();
 const flashingMark = Decoration.mark({
   attributes: {
     style: `
-      color: #00FF00;
-      font-weight: bold;
       background-color: transparent;
-      text-decoration: none;
-      text-shadow: 0 0 4px #00FF00, 0 0 6px #00FF00;
-      animation: pulseGlow 1s ease-in-out infinite alternate;
+      animation: flashGlow 800ms cubic-bezier(0.4, 0, 0.2, 1) 1;
+      will-change: text-shadow;
     `,
   },
 });
@@ -72,15 +73,10 @@ const flashingMark = Decoration.mark({
 if (typeof document !== 'undefined') {
   const style = document.createElement('style');
   style.textContent = `
-    @keyframes pulseGlow {
-      from {
-        color: #005500;
-        text-shadow: 0 0 2px #005500, 0 0 3px #005500;
-      }
-      to {
-        color: #00FF00;
-        text-shadow: 0 0 4px #00FF00, 0 0 6px #00FF00;
-      }
+    @keyframes flashGlow {
+      0% { text-shadow: 0 0 0 rgba(255, 235, 59, 0); }
+      50% { text-shadow: 0 0 3px rgba(255, 235, 59, 0.85), 0 0 8px rgba(255, 235, 59, 0.75), 0 0 14px rgba(255, 235, 59, 0.6); }
+      100% { text-shadow: 0 0 0 rgba(255, 235, 59, 0); }
     }
   `;
   document.head.appendChild(style);
@@ -144,25 +140,40 @@ export const CodeMirrorViewer = ({
 
   const ref = useRef<ReactCodeMirrorRef>({});
   const store = useStore();
+  const sdk = useBAMLSDK();
   const flashRanges = useAtomValue(flashRangesAtom);
+  const diagnostics = useAtomValue(CodeMirrorDiagnosticsAtom);
 
   useEffect(() => {
     console.log('flashRanges updated: ', flashRanges);
     if (!ref.current.view) return;
     const view = ref.current.view;
-    // TODO: Filter by filename?
-    const convertedRanges = flashRanges.map((range) => ({
+    // Only show/act on ranges that correspond to the currently open file
+    const relevantRanges = flashRanges.filter(
+      (range) => range.filePath === fileContent.id,
+    );
+    const convertedRanges = relevantRanges.map((range) => ({
       from: view.state.doc.line(range.startLine + 1).from + range.startCol,
       to: view.state.doc.line(range.endLine + 1).from + range.endCol,
     }));
-    console.log('convertedRanges: ', convertedRanges);
-    view?.dispatch({
+    // Update flashing decorations
+    view.dispatch({
       effects: [
         clearFlashingEffect.of(),
         addFlashingEffect.of(convertedRanges),
       ],
     });
-  }, [flashRanges]);
+    // Select and center the first range in the viewport
+    const first = convertedRanges[0];
+    if (first !== undefined) {
+      view.dispatch({
+        selection: { anchor: first.from, head: first.to },
+        effects: [EditorView.scrollIntoView(first.from, { y: 'center' })],
+      });
+    }
+
+  }, [flashRanges, fileContent.id]);
+
 
   const makeLinter = useCallback(() => {
     if (lang === 'baml') {
@@ -198,7 +209,7 @@ export const CodeMirrorViewer = ({
       // );
     }
     return [];
-  }, [store, lang]);
+  }, [store, lang, CodeMirrorDiagnosticsAtom]);
 
   const compartment = useMemo(() => new Compartment(), []);
 
@@ -226,7 +237,7 @@ export const CodeMirrorViewer = ({
   //   // return () => clearInterval(interval); // Clean up the interval on component unmount
   // }, [fileContent, ref, shouldScrollDown])
 
-  const setUpdateCursor = useSetAtom(updateCursorAtom);
+  // const setUpdateCursor = useSetAtom(updateCursorAtom);
 
   useEffect(() => {
     async function initializeExtensions() {
@@ -328,51 +339,51 @@ export const CodeMirrorViewer = ({
   const editorTheme =
     theme === 'dark'
       ? vscodeDarkInit({
-          styles: [
-            {
-              tag: [t.variableName],
-              color: '#dcdcaa',
-            },
-            {
-              tag: [t.brace],
-              color: '#569cd6',
-            },
-            {
-              tag: [t.variableName, t.propertyName],
-              color: '#d4d4d4',
-            },
-            {
-              tag: [t.attributeName],
-              color: '#c586c0',
-            },
-          ],
-          settings: {
-            fontSize: '11px',
-            // this must be a transparent color or selection will be invisible
-            lineHighlight: '#a1a1a730',
-            gutterBackground: 'transparent',
-            gutterForeground: '#808080',
-            gutterActiveForeground: '#808080',
-            gutterBorder: 'transparent',
+        styles: [
+          {
+            tag: [t.variableName],
+            color: '#dcdcaa',
           },
-        })
+          {
+            tag: [t.brace],
+            color: '#569cd6',
+          },
+          {
+            tag: [t.variableName, t.propertyName],
+            color: '#d4d4d4',
+          },
+          {
+            tag: [t.attributeName],
+            color: '#c586c0',
+          },
+        ],
+        settings: {
+          fontSize: '11px',
+          // this must be a transparent color or selection will be invisible
+          lineHighlight: '#a1a1a730',
+          gutterBackground: 'transparent',
+          gutterForeground: '#808080',
+          gutterActiveForeground: '#808080',
+          gutterBorder: 'transparent',
+        },
+      })
       : vscodeLightInit({
-          styles: [
-            {
-              tag: [t.attributeName],
-              color: '#ca8a04',
-            },
-          ],
-          settings: {
-            fontSize: '11px',
-            // this must be a transparent color or selection will be invisible
-            lineHighlight: '#c7c7c730',
-            gutterBackground: '#fff',
-            gutterForeground: '#808080',
-            gutterActiveForeground: '#808080',
-            gutterBorder: '#fff',
+        styles: [
+          {
+            tag: [t.attributeName],
+            color: '#ca8a04',
           },
-        });
+        ],
+        settings: {
+          fontSize: '11px',
+          // this must be a transparent color or selection will be invisible
+          lineHighlight: '#c7c7c730',
+          gutterBackground: '#fff',
+          gutterForeground: '#808080',
+          gutterActiveForeground: '#808080',
+          gutterBorder: '#fff',
+        },
+      });
 
   useEffect(() => {
     onContentChange?.(fileContent.code);
@@ -388,7 +399,7 @@ export const CodeMirrorViewer = ({
         effects: compartment.reconfigure([makeLinter()]),
       });
     }
-  }, [fileContent.code, lang, makeLinter, compartment]);
+  }, [fileContent.code, lang, makeLinter, compartment, diagnostics]);
 
   const handleReset = () => {
     // setActualFileContent(file_content);
@@ -417,14 +428,16 @@ export const CodeMirrorViewer = ({
             foldGutter: hideLineNumbers ? false : true,
           }}
           onStatistics={(data) => {
-            const pos = data.selectionAsSingle.from;
+            // Use the selection head (cursor position) for consistency
+            // data.line is the line at the cursor head position
+            const cursorPos = data.selectionAsSingle.head;
             const line = data.line.number;
-            // Calculate column by finding the difference between cursor position and line start
-            const column = pos - data.line.from + 1;
+            // Column is cursor position relative to line start (1-indexed)
+            const column = cursorPos - data.line.from + 1;
 
-            setUpdateCursor({
+            // Update cursor position via SDK navigation
+            sdk.navigation.updateCursor({
               fileName: fileContent.id,
-              fileText: ref.current?.view?.state.doc.toString() || '',
               line,
               column,
             });

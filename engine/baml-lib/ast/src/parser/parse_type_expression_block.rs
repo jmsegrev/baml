@@ -1,7 +1,7 @@
 use internal_baml_diagnostics::{DatamodelError, Diagnostics};
 
 use super::{
-    helpers::{parsing_catch_all, Pair},
+    helpers::{assert_correct_parser, parsing_catch_all, Pair},
     parse_attribute::parse_attribute,
     parse_comments::*,
     parse_identifier::parse_identifier,
@@ -9,22 +9,22 @@ use super::{
     Rule,
 };
 use crate::{
-    assert_correct_parser,
     ast::{TypeExpressionBlock, *},
-    parser::parse_field::parse_type_expr,
-}; // Add this line to import DatamodelParser
+    parser::{parse_expr::parse_expr_fn, parse_field::parse_type_expr},
+};
 
 pub(crate) fn parse_type_expression_block(
     pair: Pair<'_>,
     doc_comment: Option<Pair<'_>>,
     diagnostics: &mut Diagnostics,
 ) -> TypeExpressionBlock {
-    assert_correct_parser!(pair, Rule::type_expression_block);
+    assert_correct_parser(&pair, &[Rule::type_expression_block], diagnostics);
 
     let pair_span = pair.as_span();
     let mut name: Option<Identifier> = None;
     let mut attributes: Vec<Attribute> = Vec::new();
     let mut fields: Vec<Field<FieldType>> = Vec::new();
+    let mut methods: Vec<ExprFn> = Vec::new();
     let mut sub_type: Option<_> = None;
     let mut input = None;
 
@@ -111,6 +111,17 @@ pub(crate) fn parse_type_expression_block(
                             }
                         }
                         Rule::comment_block => pending_field_comment = Some(item),
+                        Rule::expr_fn => {
+                            let item_span = item.as_span();
+
+                            match parse_expr_fn(item, diagnostics) {
+                                Some(expr_fn) => methods.push(expr_fn),
+                                None => diagnostics.push_error(DatamodelError::new_validation_error(
+                                    "Invalid method definition",
+                                    diagnostics.span(item_span),
+                                )),
+                            }
+                        },
                         Rule::BLOCK_LEVEL_CATCH_ALL => {
                             diagnostics.push_error(DatamodelError::new_validation_error(
                                 match sub_type {
@@ -120,25 +131,36 @@ pub(crate) fn parse_type_expression_block(
                                 diagnostics.span(item.as_span()),
                             ))
                         }
-                        _ => parsing_catch_all(item, "type_expression"),
+                        _ => parsing_catch_all(item, "type_expression", diagnostics),
                     }
                 }
             }
 
-            _ => parsing_catch_all(current, "type_expression"),
+            _ => parsing_catch_all(current, "type_expression", diagnostics),
         }
     }
 
     let sub_type = sub_type.unwrap_or((SubType::Other("Subtype not found".to_string()), pair_span));
     let is_dynamic_type_def = matches!(sub_type.0, SubType::Dynamic(_));
 
+    // Some nasty type inference is required here.
+    for m in &mut methods {
+        if let Some(self_param) = m.args.args.get_mut(0) {
+            if self_param.0.name() == "self" {
+                self_param.1.field_type =
+                    FieldType::Symbol(FieldArity::Required, name.clone().unwrap(), None);
+            }
+        }
+    }
+
     match name {
         Some(name) => TypeExpressionBlock {
             name,
             fields,
+            methods,
             input,
             attributes,
-            documentation: doc_comment.and_then(parse_comment_block),
+            documentation: doc_comment.and_then(|c| parse_comment_block(c, diagnostics)),
             span: diagnostics.span(pair_span),
             sub_type: sub_type.0,
             type_span: diagnostics.span(sub_type.1),

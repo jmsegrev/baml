@@ -38,8 +38,9 @@ use tokio::{net::TcpListener, sync::RwLock};
 use tokio_stream::StreamExt;
 
 use crate::{
-    client_registry::ClientRegistry, errors::ExposedError, internal::llm_client::LLMResponse,
-    BamlRuntime, FunctionResult, RuntimeContextManager,
+    cli::dotenv::DotenvArgs, client_registry::ClientRegistry, errors::ExposedError,
+    internal::llm_client::LLMResponse, BamlRuntime, FunctionResult, RuntimeContextManager,
+    TripWire,
 };
 
 #[derive(clap::Args, Clone, Debug)]
@@ -54,6 +55,8 @@ pub struct ServeArgs {
         default_value_t = false
     )]
     no_version_check: bool,
+    #[command(flatten)]
+    dotenv: DotenvArgs,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -80,10 +83,16 @@ impl BamlOptions {
 }
 
 impl ServeArgs {
-    pub fn run(&self) -> Result<()> {
+    pub fn run(
+        &self,
+        feature_flags: internal_baml_core::feature_flags::FeatureFlags,
+    ) -> Result<()> {
+        self.dotenv.load()?;
+
         let t: Arc<tokio::runtime::Runtime> = BamlRuntime::get_tokio_singleton()?;
 
-        let (server, tcp_listener) = t.block_on(Server::new(self.from.clone(), self.port))?;
+        let (server, tcp_listener) =
+            t.block_on(Server::new(self.from.clone(), self.port, feature_flags))?;
 
         t.block_on(server.serve(tcp_listener))?;
 
@@ -173,13 +182,18 @@ enum AuthEnforcementMode {
 }
 
 impl Server {
-    pub async fn new(src_dir: PathBuf, port: u16) -> Result<(Arc<Self>, TcpListener)> {
+    pub async fn new(
+        src_dir: PathBuf,
+        port: u16,
+        feature_flags: internal_baml_core::feature_flags::FeatureFlags,
+    ) -> Result<(Arc<Self>, TcpListener)> {
         let tcp_listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
             .await
             .context(format!(
                 "Failed to bind to port {port}; try using --port PORT to specify a different port."
             ))?;
-        let baml_runtime = BamlRuntime::from_directory(&src_dir, std::env::vars().collect())?;
+        let baml_runtime =
+            BamlRuntime::from_directory(&src_dir, std::env::vars().collect(), feature_flags)?;
         Ok((
             Arc::new(Self {
                 src_dir: src_dir.clone(),
@@ -302,15 +316,18 @@ impl Server {
         //
         // .with_graceful_shutdown(signal::ctrl_c());
         baml_log::info!(
-            r#"BAML-over-HTTP listening on port {}, serving from {}
+            r#"BAML-over-HTTP listening on port {port}, serving from {src_dir}
 
-Tip: test that the server is up using `curl http://localhost:{}/_debug/ping`
+Tip: test that the server is up using `curl http://localhost:{port}/_debug/ping`
 
 (You may need to replace "localhost" with the container hostname as appropriate.)
+
+Once the server is up, open http://localhost:{port}/docs in the browser to test your routes interactively.
+
+Streaming is available via http://localhost:{port}/stream/{{FunctionName}}, but not added to openapi.yaml (no partial types yet).
 "#,
-            self.port,
-            self.src_dir.display(),
-            self.port,
+            port = self.port,
+            src_dir = self.src_dir.display(),
         );
 
         service.await?;
@@ -346,6 +363,8 @@ Tip: test that the server is up using `curl http://localhost:{}/_debug/ping`
                 client_registry.as_ref(),
                 None,
                 env_vars,
+                None, // tags
+                TripWire::new(None),
             )
             .await;
 
@@ -362,6 +381,7 @@ Tip: test that the server is up using `curl http://localhost:{}/_debug/ping`
                                 prompt,
                                 raw_output: raw_response,
                                 message,
+                                ..
                             }) = e.downcast_ref::<ExposedError>()
                             {
                                 BamlError::ValidationFailure {
@@ -389,6 +409,10 @@ Tip: test that the server is up using `curl http://localhost:{}/_debug/ping`
                 .into_response(),
                 LLMResponse::InternalFailure(message) => BamlError::InternalError {
                     message: message.clone(),
+                }
+                .into_response(),
+                LLMResponse::Cancelled(message) => BamlError::InternalError {
+                    message: format!("Cancelled: {message}"),
                 }
                 .into_response(),
             },
@@ -442,6 +466,8 @@ Tip: test that the server is up using `curl http://localhost:{}/_debug/ping`
                 client_registry.as_ref(),
                 Some(vec![]),
                 env_vars,
+                TripWire::new(None),
+                None, // tags
             );
 
             match result_stream {
@@ -482,6 +508,7 @@ Tip: test that the server is up using `curl http://localhost:{}/_debug/ping`
                                             prompt,
                                             raw_output: raw_response,
                                             message,
+                                            ..
                                         }) = e.downcast_ref::<ExposedError>()
                                         {
                                             BamlError::ValidationFailure {
@@ -512,6 +539,10 @@ Tip: test that the server is up using `curl http://localhost:{}/_debug/ping`
                             .into_response(),
                             LLMResponse::InternalFailure(message) => BamlError::InternalError {
                                 message: message.clone(),
+                            }
+                            .into_response(),
+                            LLMResponse::Cancelled(message) => BamlError::InternalError {
+                                message: format!("Cancelled: {message}"),
                             }
                             .into_response(),
                         },
@@ -614,7 +645,7 @@ Tip: test that the server is up using `curl http://localhost:{}/_debug/ping`
         .map_err(|_| BamlError::InternalError {
             message: "Failed to make placeholder generator".to_string(),
         })?;
-        let schema: OpenApiSchema = OpenApiSchema::from_ir(locked.inner.ir.as_ref());
+        let schema: OpenApiSchema = OpenApiSchema::from_ir(locked.ir.as_ref());
         serde_json::to_string(&schema).map_err(|e| {
             log::warn!("Failed to serialize openapi schema: {e}");
             BamlError::InternalError {

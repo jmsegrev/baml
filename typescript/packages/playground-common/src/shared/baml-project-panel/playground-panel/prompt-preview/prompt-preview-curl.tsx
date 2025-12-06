@@ -3,7 +3,7 @@ import { useAtomValue } from 'jotai';
 import { atom } from 'jotai';
 import { loadable } from 'jotai/utils';
 import { useTheme } from 'next-themes';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, memo } from 'react';
 import type React from 'react';
 import { useMemo } from 'react';
 import { apiKeysAtom } from '../../../../components/api-keys-dialog/atoms';
@@ -11,25 +11,28 @@ import { ctxAtom, filesAtom, runtimeAtom } from '../../atoms';
 import { selectionAtom } from '../atoms';
 import { TruncatedString } from './TruncatedString';
 import { Loader } from './components';
-import { findMediaFile } from './media-utils';
+import { vscode } from '../../vscode';
 import { EnhancedErrorRenderer } from './test-panel/components/EnhancedErrorRenderer';
+import { runtimeInstanceAtom } from '../../../../sdk/atoms/core.atoms';
 
 type CurlResult =
   | {
-      curlTextWithoutSecrets: string;
-      curlTextWithSecrets: string;
-    }
+    curlTextWithoutSecrets: string;
+    curlTextWithSecrets: string;
+  }
   | undefined
   | Error;
 
 const baseCurlAtom = atom<Promise<CurlResult>>(async (get) => {
-  const rt = get(runtimeAtom).rt;
+  const runtime = get(runtimeInstanceAtom);
   const ctx = get(ctxAtom);
   const envVars = get(apiKeysAtom);
   const files = get(filesAtom); // Add files dependency to track content changes
   const { selectedFn, selectedTc } = get(selectionAtom);
 
-  if (!selectedFn || !rt || !selectedTc || !ctx) {
+
+  if (!selectedFn || !runtime || !selectedTc) {
+    console.log('[curl] no selectedFn or runtime or selectedTc');
     return undefined;
   }
 
@@ -45,28 +48,37 @@ const baseCurlAtom = atom<Promise<CurlResult>>(async (get) => {
   let curlTextWithSecrets = '';
 
   try {
-    curlTextWithoutSecrets = await selectedFn.render_raw_curl_for_test(
-      rt,
+    // Use runtime interface method instead of calling WASM directly
+    curlTextWithoutSecrets = await runtime.renderCurlForTest(
+      selectedFn.name,
       selectedTc.name,
-      ctx,
-      false,
-      false,
-      findMediaFile,
-      envVars,
-      false, // Pass flag to indicate whether to expose secrets
+      {
+        stream: false,
+        expandImages: false,
+        exposeSecrets: false,
+      },
+      {
+        apiKeys: envVars,
+        loadMediaFile: vscode.loadMediaFile,
+      }
     );
 
-    curlTextWithSecrets = await selectedFn.render_raw_curl_for_test(
-      rt,
+
+    curlTextWithSecrets = await runtime.renderCurlForTest(
+      selectedFn.name,
       selectedTc.name,
-      ctx,
-      false,
-      false,
-      findMediaFile,
-      envVars,
-      true, // Pass flag to indicate whether to expose secrets
+      {
+        stream: false,
+        expandImages: false,
+        exposeSecrets: true,
+      },
+      {
+        apiKeys: envVars,
+        loadMediaFile: vscode.loadMediaFile,
+      }
     );
   } catch (error) {
+    console.error('[curl] error', error);
     return error as Error;
   }
 
@@ -76,10 +88,10 @@ const baseCurlAtom = atom<Promise<CurlResult>>(async (get) => {
   };
 });
 
-const curlAtom = loadable(baseCurlAtom);
+export const curlAtom = loadable(baseCurlAtom);
 
 // Syntax highlighting component for curl commands
-const SyntaxHighlightedCurl = ({ text }: { text: string }) => {
+const SyntaxHighlightedCurl = memo(({ text }: { text: string }) => {
   const [highlightedHtml, setHighlightedHtml] = useState<string>('');
   const [highlighter, setHighlighter] = useState<any | undefined>(undefined);
   const { theme } = useTheme();
@@ -139,7 +151,7 @@ const SyntaxHighlightedCurl = ({ text }: { text: string }) => {
 
   return (
     <div
-      className="w-full rounded-lg border bg-accent p-4 font-mono overflow-auto"
+      className="w-full rounded-lg border bg-accent p-4 font-mono overflow-auto text-xs"
       style={
         {
           // Use VSCode-themed CSS variables from globals.css
@@ -221,14 +233,40 @@ const SyntaxHighlightedCurl = ({ text }: { text: string }) => {
       />
     </div>
   );
-};
+}, (prev, next) => prev.text === next.text);
 
 export const PromptPreviewCurl = () => {
   const curl = useAtomValue(curlAtom);
+  const [lastCurl, setLastCurl] = useState<
+    | { curlTextWithoutSecrets: string; curlTextWithSecrets: string }
+    | undefined
+  >(undefined);
+
+
+  useEffect(() => {
+    if (curl.state === 'hasData' && curl.data && !(curl.data instanceof Error)) {
+      setLastCurl(curl.data);
+    }
+  }, [curl]);
 
   // Memoize the rendered content to prevent unnecessary re-renders
   const renderedContent = useMemo(() => {
     if (curl.state === 'loading') {
+      // While loading, show the last known cURL if available, otherwise a loader
+      if (lastCurl) {
+        return (
+          <div className="relative group">
+            <CopyButton
+              text={lastCurl.curlTextWithoutSecrets}
+              className="absolute top-1 right-1 opacity-0 transition-opacity group-hover:opacity-100 z-30"
+              size="sm"
+              variant="outline"
+              showToast={false}
+            />
+            <SyntaxHighlightedCurl text={lastCurl.curlTextWithoutSecrets} />
+          </div>
+        );
+      }
       return <Loader />;
     }
 
@@ -264,7 +302,7 @@ export const PromptPreviewCurl = () => {
         <SyntaxHighlightedCurl text={value.curlTextWithoutSecrets} />
       </div>
     );
-  }, [curl]);
+  }, [curl, lastCurl]);
 
   return renderedContent;
 };

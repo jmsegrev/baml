@@ -1,3 +1,4 @@
+mod abort_controller;
 mod errors;
 mod parse_py_type;
 mod runtime;
@@ -71,6 +72,7 @@ fn baml_py(m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<types::ClassPropertyBuilder>()?;
     m.add_class::<types::FieldType>()?;
     m.add_class::<types::ClientRegistry>()?;
+    m.add_class::<abort_controller::AbortController>()?;
 
     m.add_class::<runtime::BamlLogEvent>()?;
     m.add_class::<runtime::LogEventMetadata>()?;
@@ -102,6 +104,6 @@ fn init_debug_logger() {
     if let Err(e) =
         env_logger::try_init_from_env(env_logger::Env::new().filter("BAML_INTERNAL_LOG"))
     {
-        println!("Failed to initialize BAML DEBUG logger: {e:#}");
+        eprintln!("Failed to initialize BAML DEBUG logger: {e:#}");
     }
 }

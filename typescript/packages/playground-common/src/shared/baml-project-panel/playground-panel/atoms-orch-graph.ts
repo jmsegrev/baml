@@ -1,6 +1,16 @@
+/**
+ * Orchestration Graph Atoms
+ *
+ * These atoms are WASM-specific and handle orchestration graph visualization.
+ * They use the WASM runtime through the compatibility layer.
+ *
+ * TODO: This will be migrated when SDK supports orchestration graph features.
+ */
+
 import { atom } from 'jotai';
 import { runtimeAtom } from '../atoms';
 import { selectedFunctionObjectAtom } from './atoms';
+import { orchIndexAtom as coreOrchIndexAtom } from '../../../sdk/atoms/core.atoms';
 
 export interface TypeCount {
   // options are F (Fallback), R (Retry), D (Direct), B (Round Robin)
@@ -67,59 +77,33 @@ export interface Dimension {
   height: number;
 }
 
-export const orchIndexAtom = atom(0);
+/**
+ * Re-export orchIndexAtom from core.atoms for backward compatibility
+ * The actual atom is defined in sdk/atoms/core.atoms.ts
+ */
+export const orchIndexAtom = coreOrchIndexAtom;
+
 export const currentClientsAtom = atom((get) => {
-  const func = get(selectedFunctionObjectAtom);
-  const runtime = get(runtimeAtom).rt;
-  if (!func || !runtime) {
-    return [];
-  }
-
-  try {
-    const wasmScopes = func.orchestration_graph(runtime);
-    if (wasmScopes === null) {
-      return [];
-    }
-
-    const nodes = createClientNodes(wasmScopes);
-    return nodes.map((node) => node.name);
-  } catch (e) {
-    console.error(e);
-    return ['Error!'];
-  }
+  // TODO: Re-implement with unified types
+  // Temporarily disabled - orchestration graph needs migration
+  return [];
 });
+
+// this is a mermaid graph of the function
+export const functionGraphAtom = atom(
+  (get): { graph: string } => {
+    // TODO: Re-implement with BamlRuntimeInterface.getFunctionGraph()
+    // Temporarily disabled - function graph needs migration
+    return { graph: '' };
+  },
+);
 
 // something about the orchestration graph is broken, comment it out to make it work
 export const orchestrationNodesAtom = atom(
   (get): { nodes: GroupEntry[]; edges: Edge[] } => {
-    const func = get(selectedFunctionObjectAtom);
-    const runtime = get(runtimeAtom).rt;
-    if (!func || !runtime) {
-      return { nodes: [], edges: [] };
-    }
-
-    const wasmScopes = func.orchestration_graph(runtime);
-    if (wasmScopes === null) {
-      return { nodes: [], edges: [] };
-    }
-
-    const nodes = createClientNodes(wasmScopes);
-    const { unitNodes, groups } = buildUnitNodesAndGroups(nodes);
-
-    const edges = createEdges(unitNodes);
-
-    const positionedNodes = getPositions(groups);
-
-    positionedNodes.forEach((posNode) => {
-      const correspondingUnitNode = unitNodes.find(
-        (unitNode) => unitNode.gid === posNode.gid,
-      );
-      if (correspondingUnitNode) {
-        posNode.orch_index = correspondingUnitNode.node_index;
-      }
-    });
-
-    return { nodes: positionedNodes, edges };
+    // TODO: Re-implement with unified types
+    // Temporarily disabled - orchestration graph needs migration
+    return { nodes: [], edges: [] };
   },
 );
 

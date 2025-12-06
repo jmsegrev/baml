@@ -1,0 +1,297 @@
+name: CI - BAML Language
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+on:
+  push:
+    branches: [main, canary]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  determine_changes:
+    name: "Determine changes"
+    runs-on: ubuntu-latest
+    outputs:
+      # Flag that is raised when any code in baml_language is changed
+      code: ${{ steps.check_code.outputs.changed }}
+      # Flag for lexer changes
+      lexer: ${{ steps.check_lexer.outputs.changed }}
+      # Flag for parser changes
+      parser: ${{ steps.check_parser.outputs.changed }}
+      # Flag for HIR changes
+      hir: ${{ steps.check_hir.outputs.changed }}
+      # Flag for THIR changes
+      thir: ${{ steps.check_thir.outputs.changed }}
+      # Flag for codegen changes
+      codegen: ${{ steps.check_codegen.outputs.changed }}
+      # Flag for BEP changes
+      beps: ${{ steps.check_beps.outputs.changed }}
+      # Flag for docs/frontend changes
+      docs: ${{ steps.check_docs.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine merge base
+        id: merge_base
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref || 'canary' }}
+        run: |
+          sha=$(git merge-base HEAD "origin/${BASE_REF}")
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if code changed
+        id: check_code
+        env:
+          MERGE_BASE: ${{ steps.merge_base.outputs.sha }}
+        run: |
+          if git diff --quiet "${MERGE_BASE}...HEAD" -- \
+            ':baml_language/**' \
+            ':.github/workflows/ci.yaml' \
+            ':.github/workflows/cargo-tests.reusable.yaml' \
+          ; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if lexer code changed
+        id: check_lexer
+        env:
+          MERGE_BASE: ${{ steps.merge_base.outputs.sha }}
+        run: |
+          if git diff --quiet "${MERGE_BASE}...HEAD" -- \
+            ':baml_language/crates/baml_lexer/**' \
+            ':baml_language/crates/baml_base/**' \
+            ':baml_language/Cargo.toml' \
+            ':baml_language/Cargo.lock' \
+          ; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if parser code changed
+        id: check_parser
+        env:
+          MERGE_BASE: ${{ steps.merge_base.outputs.sha }}
+        run: |
+          if git diff --quiet "${MERGE_BASE}...HEAD" -- \
+            ':baml_language/crates/baml_parser/**' \
+            ':baml_language/crates/baml_syntax/**' \
+            ':baml_language/crates/baml_lexer/**' \
+            ':baml_language/crates/baml_base/**' \
+          ; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if HIR code changed
+        id: check_hir
+        env:
+          MERGE_BASE: ${{ steps.merge_base.outputs.sha }}
+        run: |
+          if git diff --quiet "${MERGE_BASE}...HEAD" -- \
+            ':baml_language/crates/baml_hir/**' \
+            ':baml_language/crates/baml_workspace/**' \
+            ':baml_language/crates/baml_parser/**' \
+            ':baml_language/crates/baml_base/**' \
+          ; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if THIR code changed
+        id: check_thir
+        env:
+          MERGE_BASE: ${{ steps.merge_base.outputs.sha }}
+        run: |
+          if git diff --quiet "${MERGE_BASE}...HEAD" -- \
+            ':baml_language/crates/baml_thir/**' \
+            ':baml_language/crates/baml_hir/**' \
+            ':baml_language/crates/baml_base/**' \
+          ; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if codegen code changed
+        id: check_codegen
+        env:
+          MERGE_BASE: ${{ steps.merge_base.outputs.sha }}
+        run: |
+          if git diff --quiet "${MERGE_BASE}...HEAD" -- \
+            ':baml_language/crates/baml_codegen/**' \
+            ':baml_language/crates/baml_thir/**' \
+            ':baml_language/crates/baml_base/**' \
+          ; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if BEPs changed
+        id: check_beps
+        env:
+          MERGE_BASE: ${{ steps.merge_base.outputs.sha }}
+        run: |
+          if git diff --quiet "${MERGE_BASE}...HEAD" -- \
+            ':beps/**' \
+            ':.github/workflows/beps.reusable.yaml' \
+          ; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if docs changed
+        id: check_docs
+        env:
+          MERGE_BASE: ${{ steps.merge_base.outputs.sha }}
+        run: |
+          if git diff --quiet "${MERGE_BASE}...HEAD" -- \
+            ':fern/**' \
+            ':typescript/apps/ask-baml-client/**' \
+            ':typescript/apps/sage-backend/**' \
+            ':.github/workflows/docs.reusable.yaml' \
+          ; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Call reusable workflows
+  cargo-tests:
+    name: "Cargo Tests"
+    needs: determine_changes
+    uses: ./.github/workflows/cargo-tests.reusable.yaml
+    with:
+      code_changed: ${{ needs.determine_changes.outputs.code }}
+      run_all: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/canary' }}
+    secrets: inherit
+
+  beps:
+    name: "BEPs"
+    needs: determine_changes
+    uses: ./.github/workflows/beps.reusable.yaml
+    with:
+      beps_changed: ${{ needs.determine_changes.outputs.beps }}
+      is_canary: ${{ github.ref == 'refs/heads/canary' }}
+      is_pr: ${{ github.event_name == 'pull_request' }}
+    secrets: inherit
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+      deployments: write
+
+  docs:
+    name: "Docs"
+    needs: determine_changes
+    uses: ./.github/workflows/docs.reusable.yaml
+    with:
+      docs_changed: ${{ needs.determine_changes.outputs.docs }}
+      is_canary: ${{ github.ref == 'refs/heads/canary' }}
+    secrets: inherit
+    permissions: write-all
+
+  benchmarks-instrumented:
+    name: "benchmarks instrumented (baml)"
+    runs-on: codspeed-macro
+    needs: determine_changes
+    if: |
+      (
+        github.ref == 'refs/heads/main' ||
+        github.ref == 'refs/heads/canary' ||
+        contains(github.event.pull_request.body, 'RUN_CODSPEED=1') ||
+        needs.determine_changes.outputs.lexer == 'true' ||
+        needs.determine_changes.outputs.parser == 'true' ||
+        needs.determine_changes.outputs.hir == 'true' ||
+        needs.determine_changes.outputs.thir == 'true' ||
+        needs.determine_changes.outputs.codegen == 'true'
+      )
+    timeout-minutes: 20
+    steps:
+      - name: "Checkout Branch"
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "baml_language -> target"
+
+      - name: "Install Rust toolchain"
+        run: rustup show
+        working-directory: baml_language
+
+      - name: "Install codspeed"
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed
+
+      - name: "Build benchmarks"
+        run: cargo codspeed build -p baml_tests
+        working-directory: baml_language
+
+      - name: "Run benchmarks"
+        uses: CodSpeedHQ/action@v3
+        with:
+          mode: walltime
+          run: cd baml_language && cargo codspeed run
+          token: ${{ secrets.CODSPEED_TOKEN }}
+
+  test-summary:
+    name: "Test Summary"
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - cargo-tests
+      - beps
+      - docs
+      - benchmarks-instrumented
+    steps:
+      - name: "Check test results"
+        run: |
+          if [[ "${{ needs.cargo-tests.result }}" != "success" && "${{ needs.cargo-tests.result }}" != "skipped" ]]; then
+            echo "::error::Cargo tests failed"
+            exit 1
+          fi
+
+          if [[ "${{ needs.beps.result }}" != "success" && "${{ needs.beps.result }}" != "skipped" ]]; then
+            echo "::error::BEPs workflow failed"
+            exit 1
+          fi
+
+          if [[ "${{ needs.docs.result }}" != "success" && "${{ needs.docs.result }}" != "skipped" ]]; then
+            echo "::error::Docs workflow failed"
+            exit 1
+          fi
+
+          if [[ "${{ needs.benchmarks-instrumented.result }}" != "success" && "${{ needs.benchmarks-instrumented.result }}" != "skipped" ]]; then
+            echo "::error::Benchmarks failed"
+            exit 1
+          fi
+
+          echo "All required checks passed!"

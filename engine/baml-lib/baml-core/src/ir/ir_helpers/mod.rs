@@ -6,9 +6,9 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 use baml_types::{
-    ir_type::{TypeGeneric, UnionConstructor},
-    BamlMap, BamlValue, BamlValueWithMeta, Constraint, ConstraintLevel, LiteralValue, TypeIR,
-    TypeValue, UnionType,
+    ir_type::{TypeGeneric, TypeNonStreaming, UnionConstructor},
+    BamlMap, BamlMediaType, BamlValue, BamlValueWithMeta, Constraint, ConstraintLevel,
+    LiteralValue, TypeIR, TypeValue, UnionType,
 };
 use indexmap::IndexMap;
 use internal_baml_ast::ast::{WithIdentifier, WithSpan};
@@ -74,6 +74,14 @@ pub trait IRHelper {
         params: &BamlMap<String, BamlValue>,
         coerce_settings: ArgCoercer,
     ) -> Result<IndexMap<String, BamlValueWithMeta<TypeIR>>>;
+
+    /// Pretty-print a list of arguments suitable for use in a `test` block.
+    fn get_dummy_args(
+        &self,
+        indent: usize,
+        allow_multiline: bool,
+        params: &BamlMap<String, TypeIR>,
+    ) -> String;
 }
 
 pub trait IRSemanticStreamingHelper {
@@ -122,6 +130,8 @@ pub trait IRHelperExtended: IRSemanticStreamingHelper {
         }
 
         match (base, other) {
+            // top can meet any other type.
+            (TypeIR::Top(_), _) | (_, TypeIR::Top(_)) => true,
             // TODO: O(n)
             (TypeIR::RecursiveTypeAlias { name, .. }, _) => self
                 .get_all_recursive_aliases(name)
@@ -206,7 +216,7 @@ pub trait IRHelperExtended: IRSemanticStreamingHelper {
         value: BamlValue,
         field_type: TypeIR,
     ) -> anyhow::Result<BamlValueWithMeta<TypeIR>> {
-        let value_with_empty_meta = BamlValueWithMeta::with_const_meta(&value, ());
+        let value_with_empty_meta = BamlValueWithMeta::with_same_meta_at_all_nodes(&value, ());
         let res = self
             .distribute_type_with_meta(value_with_empty_meta, field_type)?
             .map_meta_owned(|(_, meta)| meta);
@@ -380,6 +390,205 @@ pub trait IRHelperExtended: IRSemanticStreamingHelper {
     }
 }
 
+fn get_dummy_value(
+    ir: &IntermediateRepr,
+    indent: usize,
+    allow_multiline: bool,
+    t: &TypeIR,
+    visited: &mut std::collections::HashSet<String>,
+) -> String {
+    fn type_complexity(t: &TypeIR) -> usize {
+        match t {
+            TypeIR::Primitive(TypeValue::Null, _) => 0,
+            TypeIR::Primitive(TypeValue::Bool, _) => 1,
+            TypeIR::Primitive(TypeValue::Int, _) => 2,
+            TypeIR::Primitive(TypeValue::Float, _) => 3,
+            TypeIR::Primitive(TypeValue::String, _) => 4,
+            TypeIR::Primitive(TypeValue::Media(_), _) => 5,
+            TypeIR::Literal(_, _) => 6,
+            TypeIR::Enum { .. } => 7,
+            TypeIR::List(_, _) => 10,
+            TypeIR::Map(_, _, _) => 12,
+            TypeIR::Class { .. } => 15,
+            TypeIR::Tuple(_, _) => 20,
+            TypeIR::Union(_, _) => 25,
+            TypeIR::RecursiveTypeAlias { .. } => 30,
+            TypeIR::Arrow(_, _) => 35,
+            TypeIR::Top(_) => 40,
+        }
+    }
+    let indent_str = "  ".repeat(indent);
+    match t {
+        TypeIR::Primitive(t, _) => {
+            match t {
+                TypeValue::String => {
+                    if allow_multiline {
+                        format!(
+                            "#\"\n{indent1}hello world\n{indent_str}\"#",
+                            indent1 = "  ".repeat(indent + 1)
+                        )
+                    } else {
+                        "\"a_string\"".to_string()
+                    }
+                }
+                TypeValue::Int => "123".to_string(),
+                TypeValue::Float => "0.5".to_string(),
+                TypeValue::Bool => "true".to_string(),
+                TypeValue::Null => "null".to_string(),
+                TypeValue::Media(BamlMediaType::Image) => {
+                    "{ url \"https://imgs.xkcd.com/comics/standards.png\" }".to_string()
+                }
+                TypeValue::Media(BamlMediaType::Audio) => {
+                    "{ url \"https://actions.google.com/sounds/v1/emergency/beeper_emergency_call.ogg\" }".to_string()
+                }
+                TypeValue::Media(BamlMediaType::Pdf) => {
+                    "{ url \"https://ia801801.us.archive.org/15/items/the-great-gatsby_202101/TheGreatGatsby.pdf\" }".to_string()
+                }
+                TypeValue::Media(BamlMediaType::Video) => {
+                    "{ url \"https://samplelib.com/lib/preview/mp4/sample-5s.mp4\" }".to_string()
+                }
+            }
+        }
+        TypeIR::Literal(literal_value, _) => match literal_value {
+            LiteralValue::String(s) => format!("\"{s}\""),
+            LiteralValue::Int(i) => i.to_string(),
+            LiteralValue::Bool(b) => b.to_string(),
+        },
+        TypeIR::Enum { name, .. } => {
+            // Try to get the first enum value from the IR
+            if let Ok(enum_walker) = ir.find_enum(name) {
+                if let Some(first_value) = enum_walker.walk_values().next() {
+                    first_value.name().to_string()
+                } else {
+                    format!("ENUM_VALUE_{}", name.to_uppercase())
+                }
+            } else {
+                format!("ENUM_VALUE_{}", name.to_uppercase())
+            }
+        }
+        TypeIR::Class { name, .. } => {
+            // Try to get the class fields from the IR
+            if let Ok(class_walker) = ir.find_class(name) {
+                let field_lines: Vec<String> = class_walker
+                    .walk_fields()
+                    .map(|field| {
+                        let field_name = field.name();
+                        let field_type = field.r#type();
+                        let field_dummy = get_dummy_value(ir, indent + 1, allow_multiline, field_type, visited);
+                        format!("{}  {} {}", "  ".repeat(indent + 1), field_name, field_dummy)
+                    })
+                    .collect();
+
+                if field_lines.is_empty() {
+                    if allow_multiline {
+                        format!("{{\n{indent1}// Empty class\n{indent_str}}}", indent1 = "  ".repeat(indent + 1))
+                    } else {
+                        "{}".to_string()
+                    }
+                } else if allow_multiline {
+                    format!("{{\n{}\n{indent_str}}}", field_lines.join("\n"))
+                } else {
+                    format!("{{ {} }}", field_lines.join(", "))
+                }
+            } else {
+                // Fallback if class not found in IR
+                if allow_multiline {
+                    format!(
+                        "{{\n{indent1}// Unknown class {name}\n{indent_str}}}",
+                        indent1 = "  ".repeat(indent + 1)
+                    )
+                } else {
+                    "{}".to_string()
+                }
+            }
+        }
+        TypeIR::RecursiveTypeAlias { name, .. } => {
+            // Prevent infinite recursion by tracking visited aliases
+            if visited.contains(name) {
+                return "null".to_string();
+            }
+
+            visited.insert(name.clone());
+
+            // Try to resolve the alias and find the simplest variant
+            let result = if let Some(resolved_type) = ir.recursive_alias_definition(name) {
+                // For unions, pick the simplest variant (typically primitives first)
+                match resolved_type {
+                    TypeIR::Union(variants, _) => {
+                        // Find the simplest variant (prefer primitives, then enums, etc.)
+                        let default_null = TypeIR::Primitive(TypeValue::Null, Default::default());
+                        let simplest = variants
+                            .iter_include_null()
+                            .iter()
+                            .min_by_key(|variant| type_complexity(variant))
+                            .map_or(&default_null, |v| v);
+                        get_dummy_value(ir, indent, allow_multiline, simplest, visited)
+                    }
+                    _ => get_dummy_value(ir, indent, allow_multiline, resolved_type, visited)
+                }
+            } else {
+                "null".to_string()
+            };
+
+            visited.remove(name);
+            result
+        }
+        TypeIR::List(item, _) => {
+            let dummy = get_dummy_value(ir, indent + 1, allow_multiline, item, visited);
+            if allow_multiline {
+                format!(
+                    "[\n{indent1}{dummy},\n{indent1}{dummy}\n{indent_str}]",
+                    dummy = dummy,
+                    indent1 = "  ".repeat(indent + 1)
+                )
+            } else {
+                format!("[{dummy}, {dummy}]")
+            }
+        }
+        TypeIR::Map(k, v, _) => {
+            let dummy_k = get_dummy_value(ir, indent, false, k, visited);
+            let dummy_v = get_dummy_value(ir, indent + 1, allow_multiline, v, visited);
+            if allow_multiline {
+                format!(
+                    r#"{{
+{indent1}{dummy_k} {dummy_v}
+{indent_str}}}"#,
+                    indent1 = "  ".repeat(indent + 1),
+                )
+            } else {
+                format!("{{ {dummy_k} {dummy_v} }}")
+            }
+        }
+        TypeIR::Union(fields, _) => {
+            // Find the simplest variant to avoid infinite loops
+            let default_null = TypeIR::Primitive(TypeValue::Null, Default::default());
+            let simplest = fields
+                .iter_include_null()
+                .iter()
+                .min_by_key(|variant| type_complexity(variant))
+                .map_or(&default_null, |v| v);
+            get_dummy_value(ir, indent, allow_multiline, simplest, visited)
+        }
+        TypeIR::Tuple(vals, _) => {
+            let dummy = vals
+                .iter()
+                .map(|f| get_dummy_value(ir, 0, false, f, visited))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({dummy},)")
+        }
+        TypeIR::Arrow(_, _) => "null /* Arrow types not supported in dummy generation */".to_string(),
+        TypeIR::Top(_) => "null /* Top type - should be resolved before dummy generation */".to_string(),
+    }
+}
+
+fn get_dummy_field(ir: &IntermediateRepr, indent: usize, name: &str, t: &TypeIR) -> String {
+    let indent_str = "  ".repeat(indent);
+    let mut visited = std::collections::HashSet::new();
+    let dummy = get_dummy_value(ir, indent, true, t, &mut visited);
+    format!("{indent_str}{name} {dummy}")
+}
+
 impl IRHelper for IntermediateRepr {
     fn find_test<'a>(
         &'a self,
@@ -392,7 +601,6 @@ impl IRHelper for IntermediateRepr {
                 // Get best match.
                 let tests = function
                     .walk_tests()
-                    .inspect(|t| log::info!("walking test: {:?}", t.item.1.elem.name))
                     .map(|t| t.item.1.elem.name.as_str())
                     .collect::<Vec<_>>();
                 error_not_found!("test", test_name, &tests)
@@ -459,8 +667,9 @@ impl IRHelper for IntermediateRepr {
             Some(f) => Ok(f),
 
             None => {
-                // Get best match.
-                let functions = self.walk_functions().map(|f| f.name()).collect::<Vec<_>>();
+                // Get best match from both LLM functions and expr functions
+                let mut functions = self.walk_functions().map(|f| f.name()).collect::<Vec<_>>();
+                functions.extend(self.walk_expr_fns().map(|f| f.item.elem.name.as_str()));
                 error_not_found!("function", function_name, &functions)
             }
         }
@@ -478,11 +687,12 @@ impl IRHelper for IntermediateRepr {
             Some(f) => Ok(f),
 
             None => {
-                // Get best match.
-                let functions = self
+                // Get best match from both expr functions and LLM functions
+                let mut functions = self
                     .walk_expr_fns()
                     .map(|f| f.item.elem.name.clone())
                     .collect::<Vec<_>>();
+                functions.extend(self.walk_functions().map(|f| f.name().to_string()));
                 error_not_found!("function", function_name, &functions)
             }
         }
@@ -767,6 +977,19 @@ impl IRHelper for IntermediateRepr {
             Ok(baml_arg_map)
         }
     }
+
+    fn get_dummy_args(
+        &self,
+        indent: usize,
+        allow_multiline: bool,
+        params: &BamlMap<String, TypeIR>,
+    ) -> String {
+        params
+            .iter()
+            .map(|(param_name, param_type)| get_dummy_field(self, indent, param_name, param_type))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 impl IRHelperExtended for IntermediateRepr {
@@ -857,6 +1080,7 @@ impl IRSemanticStreamingHelper for IntermediateRepr {
 /// child-having variants?).
 fn item_type(ir: &(impl IRHelperExtended + ?Sized), field_type: &TypeIR) -> Option<TypeIR> {
     let res = match field_type {
+        TypeIR::Top(_) => None,
         TypeIR::Class { .. } => None,
         TypeIR::Enum { .. } => None,
         TypeIR::List(inner, _) => Some(*inner.clone()),
@@ -907,11 +1131,12 @@ where
         } => ir
             .recursive_alias_definition(alias_name)
             .and_then(|alias_definition| map_types(ir, alias_definition)),
-        TypeIR::Primitive(_, _) => None,
-        TypeIR::Enum { .. } => None,
-        TypeIR::List(_, _) => None,
-        TypeIR::Literal(_, _) => None,
-        TypeIR::Tuple(_, _) => None,
+        TypeIR::Top(_)
+        | TypeIR::Primitive(_, _)
+        | TypeIR::Enum { .. }
+        | TypeIR::List(_, _)
+        | TypeIR::Literal(_, _)
+        | TypeIR::Tuple(_, _) => None,
         TypeIR::Union(variants, _) => {
             let variant_map_types: Vec<(TypeIR, TypeIR)> = variants
                 .iter_include_null()
@@ -977,62 +1202,100 @@ fn distribute_infer_class<T: Clone + std::fmt::Debug>(
     ))
 }
 
-pub fn infer_type<Meta: Default + std::cmp::PartialEq + std::fmt::Debug>(
-    value: &BamlValue,
-) -> Option<TypeGeneric<Meta>>
+pub fn infer_type<Meta>(value: &BamlValue) -> Option<TypeGeneric<Meta>>
 where
+    Meta: Clone + Default + PartialEq,
     TypeGeneric<Meta>: UnionConstructor<Meta>,
 {
-    let ret = match value {
-        BamlValue::Int(_) => Some(TypeGeneric::Primitive(TypeValue::Int, Default::default())),
-        BamlValue::Bool(_) => Some(TypeGeneric::Primitive(TypeValue::Bool, Default::default())),
-        BamlValue::Float(_) => Some(TypeGeneric::Primitive(TypeValue::Float, Default::default())),
-        BamlValue::String(_) => Some(TypeGeneric::Primitive(
-            TypeValue::String,
-            Default::default(),
-        )),
-        BamlValue::Null => Some(TypeGeneric::Primitive(TypeValue::Null, Default::default())),
+    let baml_value_with_meta = infer_value_with_type(value);
+    Some(baml_value_with_meta.meta().clone())
+}
+
+pub fn infer_value_with_type<Meta>(value: &BamlValue) -> BamlValueWithMeta<TypeGeneric<Meta>>
+where
+    Meta: Clone + Default + PartialEq,
+    TypeGeneric<Meta>: UnionConstructor<Meta>,
+{
+    match value {
+        BamlValue::Int(i) => BamlValueWithMeta::Int(
+            *i,
+            TypeGeneric::Primitive(TypeValue::Int, Default::default()),
+        ),
+        BamlValue::Bool(b) => BamlValueWithMeta::Bool(
+            *b,
+            TypeGeneric::Primitive(TypeValue::Bool, Default::default()),
+        ),
+        BamlValue::Float(f) => BamlValueWithMeta::Float(
+            *f,
+            TypeGeneric::Primitive(TypeValue::Float, Default::default()),
+        ),
+        BamlValue::String(s) => BamlValueWithMeta::String(
+            s.clone(),
+            TypeGeneric::Primitive(TypeValue::String, Default::default()),
+        ),
+        BamlValue::Null => {
+            BamlValueWithMeta::Null(TypeGeneric::Primitive(TypeValue::Null, Default::default()))
+        }
         BamlValue::Map(pairs) => {
-            let v_tys = pairs
+            let pairs: BamlMap<String, BamlValueWithMeta<TypeGeneric<Meta>>> = pairs
                 .iter()
-                .filter_map(|(_, v)| infer_type::<Meta>(v))
-                .collect::<Vec<_>>();
-            let k_ty = TypeGeneric::Primitive(TypeValue::String, Meta::default());
+                .map(|(k, v)| (k.clone(), infer_value_with_type(v)))
+                .collect();
+            let v_tys = pairs.values().map(|v| v.meta().clone()).collect::<Vec<_>>();
+            let k_ty = TypeGeneric::Primitive(TypeValue::String, Default::default());
             let v_ty = match v_tys.len() {
-                0 => None,
-                _ => Some(TypeGeneric::union(v_tys)),
-            }?;
-            Some(TypeGeneric::map(k_ty, v_ty))
+                0 => TypeGeneric::Primitive(TypeValue::Null, Default::default()),
+                _ => TypeGeneric::union(v_tys.to_vec()),
+            };
+            BamlValueWithMeta::Map(pairs, TypeGeneric::map(k_ty, v_ty))
         }
         BamlValue::List(items) => {
+            let items: Vec<BamlValueWithMeta<TypeGeneric<Meta>>> =
+                items.iter().map(infer_value_with_type).collect();
             let item_tys = items
                 .iter()
-                .filter_map(infer_type)
+                .map(|v| v.meta().clone())
                 .dedup()
                 .collect::<Vec<_>>();
             let item_ty = match item_tys.len() {
-                0 => None,
-                _ => Some(TypeGeneric::union(item_tys)),
-            }?;
-            Some(TypeGeneric::List(Box::new(item_ty), Default::default()))
+                0 => TypeGeneric::Primitive(TypeValue::Null, Default::default()),
+                _ => TypeGeneric::union(item_tys),
+            };
+            BamlValueWithMeta::List(
+                items,
+                TypeGeneric::List(Box::new(item_ty), Default::default()),
+            )
         }
-        BamlValue::Media(m) => Some(TypeGeneric::Primitive(
-            TypeValue::Media(m.media_type),
-            Default::default(),
-        )),
-        BamlValue::Enum(enum_name, _) => Some(TypeGeneric::Enum {
-            name: enum_name.clone(),
-            dynamic: false,
-            meta: Default::default(),
-        }),
-        BamlValue::Class(class_name, _) => Some(TypeGeneric::Class {
-            name: class_name.clone(),
-            mode: baml_types::ir_type::StreamingMode::NonStreaming,
-            dynamic: false,
-            meta: Default::default(),
-        }),
-    };
-    ret
+        BamlValue::Media(m) => BamlValueWithMeta::Media(
+            m.clone(),
+            TypeGeneric::Primitive(TypeValue::Media(m.media_type), Default::default()),
+        ),
+        BamlValue::Enum(enum_name, v) => BamlValueWithMeta::Enum(
+            enum_name.clone(),
+            v.clone(),
+            TypeGeneric::Enum {
+                name: enum_name.clone(),
+                dynamic: false,
+                meta: Default::default(),
+            },
+        ),
+        BamlValue::Class(class_name, fields) => {
+            let fields: BamlMap<String, BamlValueWithMeta<TypeGeneric<Meta>>> = fields
+                .iter()
+                .map(|(k, v)| (k.clone(), infer_value_with_type(v)))
+                .collect();
+            BamlValueWithMeta::Class(
+                class_name.clone(),
+                fields,
+                TypeGeneric::Class {
+                    name: class_name.clone(),
+                    mode: baml_types::ir_type::StreamingMode::NonStreaming,
+                    dynamic: false,
+                    meta: Default::default(),
+                },
+            )
+        }
+    }
 }
 
 /// Derive the simplest type that can categorize a given value. This is meant to be used
@@ -1640,6 +1903,53 @@ mod subtype_tests {
     //  "a" (Meta: Type: JsonValue),
     //  {}  (Meta: Type: JsonValue),
     // ] (Meta: Type: JsonValue)
+
+    #[test]
+    fn test_get_dummy_args() {
+        let ir = make_test_ir(
+            r##"
+            class Person {
+              name string
+              age int
+            }
+
+            type JsonValue = float | JsonValue[] | map<string, JsonValue>
+            "##,
+        )
+        .unwrap();
+
+        let mut params = BamlMap::new();
+        params.insert("user_name".to_string(), TypeIR::string());
+        params.insert(
+            "score".to_string(),
+            TypeIR::Primitive(TypeValue::Float, Default::default()),
+        );
+        params.insert("person".to_string(), TypeIR::class("Person"));
+        params.insert(
+            "data".to_string(),
+            TypeIR::union(vec![TypeIR::string(), TypeIR::int()]),
+        );
+        params.insert(
+            "json_data".to_string(),
+            TypeIR::recursive_type_alias("JsonValue"),
+        );
+
+        let result = ir.get_dummy_args(1, true, &params);
+
+        // Check that all parameters are included
+        assert!(result.contains("user_name"));
+        assert!(result.contains("score"));
+        assert!(result.contains("person"));
+        assert!(result.contains("data"));
+        assert!(result.contains("json_data"));
+
+        // Check basic formatting
+        assert!(result.contains("  user_name")); // proper indentation
+        assert!(result.contains("0.5")); // float value
+        assert!(result.contains("name") && result.contains("age")); // Person class fields
+
+        println!("Generated dummy args:\n{result}");
+    }
 
     #[test]
     fn test_item_type() {

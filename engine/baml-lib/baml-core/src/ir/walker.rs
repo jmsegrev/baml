@@ -26,6 +26,14 @@ impl<'a> Walker<'a, &'a ExprFunctionNode> {
         self.elem().inputs()
     }
 
+    pub fn output(&self) -> &'a baml_types::TypeIR {
+        &self.elem().output
+    }
+
+    pub fn span(&self) -> Option<&crate::Span> {
+        self.item.attributes.span.as_ref()
+    }
+
     pub fn walk_tests(
         &'a self,
     ) -> impl Iterator<Item = Walker<'a, (&'a ExprFunctionNode, &'a TestCase)>> {
@@ -44,6 +52,18 @@ impl<'a> Walker<'a, &'a ExprFunctionNode> {
         test_name: &str,
     ) -> Option<Walker<'a, (&'a ExprFunctionNode, &'a TestCase)>> {
         self.walk_tests().find(|t| t.item.1.elem.name == test_name)
+    }
+
+    pub fn graph(&self) -> String {
+        // example mermaid graph
+        r#"
+        graph TD
+            A[Function] --> B[Function]
+            B --> C[Function]
+            C --> D[Function]
+            D --> E[Function]
+        "#
+        .to_string()
     }
 }
 
@@ -258,6 +278,13 @@ impl<'a> Walker<'a, (&'a ExprFunctionNode, &'a TestCase)> {
             .iter()
             .map(|(k, v)| Ok((k.clone(), v.resolve_serde::<BamlValue>(ctx))))
             .collect()
+    }
+
+    pub fn function(&'a self) -> Walker<'a, &'a ExprFunctionNode> {
+        Walker {
+            ir: self.ir,
+            item: self.item.0,
+        }
     }
 }
 
@@ -483,6 +510,10 @@ impl<'a> Walker<'a, &'a Field> {
             .description()
             .map(|v| v.resolve(ctx))
             .transpose()
+    }
+
+    pub fn skip(&self, ctx: &EvaluationContext<'_>) -> Result<bool> {
+        Ok(self.item.attributes.skip())
     }
 
     pub fn streaming_behavior(&self) -> StreamingBehavior {

@@ -3,6 +3,7 @@
 // but without the wasm-bindgen dependency.
 // Wasm-bindgen causes strange issues with ruby builds so we'd rather not add that dependency if we can.
 
+use baml_types::FunctionFlavor;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -41,19 +42,24 @@ pub struct BamlParam {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BamlTestCase {
+pub struct BamlFunctionTestCasePair {
     pub name: String,
     pub inputs: Vec<BamlParam>,
     pub error: Option<String>,
+    /// The span of `test TestFoo`
     pub span: BamlSpan,
-    pub parent_functions: Vec<BamlParentFunction>,
+    /// The span of `FnBar` in `functions [FnFoo, FnBar, FnBaz]`
+    /// This is wired through to allow re-sorting these as the caller desires.
+    pub function_name_span: Option<BamlSpan>,
+    pub function: BamlParentFunction,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BamlFunction {
     pub name: String,
     pub span: BamlSpan,
-    pub test_cases: Vec<BamlTestCase>,
+    pub function_type: FunctionFlavor,
+    pub test_cases: Vec<BamlFunctionTestCasePair>,
     pub test_snippet: String,
     pub signature: String,
 }

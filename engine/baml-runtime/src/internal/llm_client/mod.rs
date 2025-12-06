@@ -92,12 +92,27 @@ pub enum ResolveMediaUrls {
     // google: supports b64 w mime, url if its a google file uri (gs://)
     // openai: supports URLs w/o mime (b64 data URLs also work here)
     // vertex: supports URLs w/ mime, b64 w/ mime
-    Always,
-    IfMatchesGoogleFileUri,
-    // EnsureMime: always add the mime type to the request (which means if it's a url, we may need to resolve it to find the mime type)
-    EnsureMime,
-    // Never: don't resolve media urls
-    Never,
+    SendBase64,
+    SendBase64UnlessGoogleUrl,
+    // SendUrlAddMimeType: always add the mime type to the request (which means if it's a url, we may need to resolve it to find the mime type)
+    SendUrlAddMimeType,
+    // SendUrl: don't resolve media urls
+    SendUrl,
+}
+
+impl From<internal_llm_client::ResolveMediaUrls> for ResolveMediaUrls {
+    fn from(value: internal_llm_client::ResolveMediaUrls) -> Self {
+        match value {
+            internal_llm_client::ResolveMediaUrls::SendBase64 => ResolveMediaUrls::SendBase64,
+            internal_llm_client::ResolveMediaUrls::SendBase64UnlessGoogleUrl => {
+                ResolveMediaUrls::SendBase64UnlessGoogleUrl
+            }
+            internal_llm_client::ResolveMediaUrls::SendUrlAddMimeType => {
+                ResolveMediaUrls::SendUrlAddMimeType
+            }
+            internal_llm_client::ResolveMediaUrls::SendUrl => ResolveMediaUrls::SendUrl,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -137,6 +152,8 @@ pub enum LLMResponse {
     /// BAML failed to make an HTTP request to a model, because of some internal
     /// error after the user's args passed validation
     InternalFailure(String),
+    /// The operation was cancelled by the user
+    Cancelled(String),
 }
 
 impl Error for LLMResponse {}
@@ -155,6 +172,9 @@ impl crate::tracing::Visualize for LLMResponse {
             Self::InternalFailure(message) => {
                 format!("{}", format!("Failed before LLM call: {message}").red())
             }
+            Self::Cancelled(message) => {
+                format!("{}", format!("Operation cancelled: {message}").yellow())
+            }
         }
     }
 }
@@ -168,6 +188,7 @@ impl std::fmt::Display for LLMResponse {
                 write!(f, "Failed before LLM call (user error): {message}")
             }
             Self::InternalFailure(message) => write!(f, "Failed before LLM call: {message}"),
+            Self::Cancelled(message) => write!(f, "Operation cancelled: {message}"),
         }
     }
 }
@@ -183,6 +204,7 @@ impl LLMResponse {
             Self::InternalFailure(message) => {
                 Err(anyhow::anyhow!("Failed before LLM call: {message}"))
             }
+            Self::Cancelled(message) => Err(anyhow::anyhow!("Operation cancelled: {message}")),
         }
     }
 }
@@ -209,6 +231,7 @@ pub enum ErrorCode {
     RateLimited,           // 429
     ServerError,           // 500
     ServiceUnavailable,    // 503
+    Timeout,               // Request timeout
 
     // We failed to parse the response
     UnsupportedResponse(u16),
@@ -225,6 +248,7 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::RateLimited => f.write_str("RateLimited (429)"),
             ErrorCode::ServerError => f.write_str("ServerError (500)"),
             ErrorCode::ServiceUnavailable => f.write_str("ServiceUnavailable (503)"),
+            ErrorCode::Timeout => f.write_str("Timeout (408)"),
             ErrorCode::UnsupportedResponse(code) => write!(f, "BadResponse {code}"),
             ErrorCode::Other(code) => write!(f, "Unspecified error code: {code}"),
         }
@@ -261,6 +285,7 @@ impl ErrorCode {
             ErrorCode::RateLimited => 429,
             ErrorCode::ServerError => 500,
             ErrorCode::ServiceUnavailable => 503,
+            ErrorCode::Timeout => 408, // HTTP 408 Request Timeout
             ErrorCode::UnsupportedResponse(code) => *code,
             ErrorCode::Other(code) => *code,
         }
@@ -287,6 +312,7 @@ pub struct LLMCompleteResponseMetadata {
     pub prompt_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
 }
 
 // This is how the response gets logged if you print the result to the console.

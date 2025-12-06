@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use generators_lib::version_check::GeneratorType;
 use internal_baml_core::configuration::GeneratorDefaultClientMode;
 
-use crate::{baml_src_files, BamlRuntime};
+use crate::{baml_src_files, BamlRuntime, InternalRuntimeInterface};
 
 #[derive(clap::Args, Debug)]
 pub struct GenerateArgs {
@@ -15,11 +16,21 @@ pub struct GenerateArgs {
         default_value_t = false
     )]
     pub(super) no_version_check: bool,
+    #[arg(
+        long,
+        help = "Strip test blocks from inlined BAML to reduce generated file size",
+        default_value_t = false
+    )]
+    pub no_tests: bool,
 }
 
 impl GenerateArgs {
-    pub fn run(&self, defaults: super::RuntimeCliDefaults) -> Result<()> {
-        let result = self.generate_clients(defaults);
+    pub fn run(
+        &self,
+        defaults: super::RuntimeCliDefaults,
+        feature_flags: internal_baml_core::feature_flags::FeatureFlags,
+    ) -> Result<()> {
+        let result = self.generate_clients(defaults, feature_flags);
 
         if let Err(e) = result {
             baml_log::error!("Error generating clients: {:?}", e);
@@ -29,13 +40,37 @@ impl GenerateArgs {
         Ok(())
     }
 
-    fn generate_clients(&self, defaults: super::RuntimeCliDefaults) -> Result<()> {
+    fn generate_clients(
+        &self,
+        defaults: super::RuntimeCliDefaults,
+        feature_flags: internal_baml_core::feature_flags::FeatureFlags,
+    ) -> Result<()> {
+        // Log enabled features
+        if feature_flags.is_beta_enabled() {
+            baml_log::info!("Beta features enabled - experimental warnings will be suppressed");
+        }
+        if feature_flags.should_display_warnings() {
+            baml_log::info!("Warning display enabled - all warnings will be shown");
+        }
+
         // Set BAML_GENERATE to prevent starting the tracing publisher
         let mut env_vars: std::collections::HashMap<String, String> = std::env::vars().collect();
         env_vars.insert("BAML_GENERATE".to_string(), "1".to_string());
 
-        let runtime = BamlRuntime::from_directory(&self.from, env_vars)
+        baml_log::info!(
+            "Generating clients with CLI version: {}",
+            env!("CARGO_PKG_VERSION")
+        );
+
+        let runtime = BamlRuntime::from_directory(&self.from, env_vars, feature_flags.clone())
             .context("Failed to build BAML runtime")?;
+
+        // Display warnings only if the feature flag is enabled
+        let diagnostics = &runtime.diagnostics;
+        if feature_flags.should_display_warnings() && diagnostics.has_warnings() {
+            eprintln!("{}", diagnostics.warnings_to_pretty_string());
+        }
+
         let src_files = baml_src_files(&self.from)
             .context("Failed while searching for .baml files in baml_src/")?;
         let all_files = src_files
@@ -44,7 +79,12 @@ impl GenerateArgs {
             .collect::<Result<_>>()
             .context("Failed while reading .baml files in baml_src/")?;
         let generated = runtime
-            .run_codegen(&all_files, self.no_version_check)
+            .run_codegen(
+                &all_files,
+                self.no_version_check,
+                GeneratorType::CLI,
+                self.no_tests,
+            )
             .context("Client generation failed")?;
 
         // give the user a working config to copy-paste (so we need to run it through generator again)
@@ -101,6 +141,7 @@ impl GenerateArgs {
                         None,
                     )
                     .context("Failed while resolving .baml paths in baml_src/")?,
+                    GeneratorType::CLI,
                 )
                 .context(format!(
                     "Failed to run generator for {client_type} in {}",

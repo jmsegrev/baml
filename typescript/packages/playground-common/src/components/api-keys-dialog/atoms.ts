@@ -2,8 +2,7 @@ import { atom } from 'jotai';
 import { atomWithStorage } from 'jotai/utils';
 import { vscodeLocalStorageStore } from '../../shared/baml-project-panel/Jotai';
 import { vscode } from '../../shared/baml-project-panel/vscode';
-import { proxyUrlAtom } from '../../shared/baml-project-panel/atoms';
-import { runtimeAtom } from '../../shared/baml-project-panel/atoms';
+import { proxyUrlAtom, runtimeAtom } from '../../shared/baml-project-panel/atoms';
 
 export const apiKeyVisibilityAtom = atom<Record<string, boolean>>({});
 
@@ -32,7 +31,7 @@ export const showApiKeyDialogAtom = atom(
 
     // Check if ALL required vars are missing
     const hasMissingVars =
-      requiredVars.length > 0 && requiredVars.every((key) => !envVars[key])
+      requiredVars.length > 0 && requiredVars.every((key: string) => !envVars[key])
 
     const hasShownDialog = get(hasShownApiKeyDialogAtom)
     if (hasShownDialog) return apiKeyDialogOpen
@@ -78,10 +77,10 @@ export const envKeyValuesAtom = atom(
       | { itemIndex: number; remove: true }
       // Insert key
       | {
-          itemIndex: null;
-          key: string;
-          value?: string;
-        },
+        itemIndex: null;
+        key: string;
+        value?: string;
+      },
   ) => {
     if (update.itemIndex !== null) {
       const keyValues = [...get(envKeyValueStorage)];
@@ -167,6 +166,7 @@ export const apiKeysAtom = atom(
     const { proxyEnabled, proxyUrl } = get(proxyUrlAtom);
     const userEnvVarsUnescaped = get(userApiKeysAtom);
 
+
     // escape env vars that may have \n,\t in them
     // we don't replace \" because its a bit trickier, but if users report bugs, we should fix this.
     const userEnvVars = Object.fromEntries(
@@ -175,14 +175,17 @@ export const apiKeysAtom = atom(
 
     if (!proxyEnabled) {
       // if proxy is not enabled, just return user vars without BOUNDARY_PROXY_URL
+      console.log('[apiKeysAtom] Proxy disabled, returning user vars without BOUNDARY_PROXY_URL');
       return userEnvVars;
     }
 
     if (proxyUrl === undefined) {
+      console.log('[apiKeysAtom] Proxy URL undefined, returning user vars');
       return userEnvVars;
     }
 
     // Add or update BOUNDARY_PROXY_URL based on current proxy settings
+    console.log('[apiKeysAtom] Adding BOUNDARY_PROXY_URL:', proxyUrl);
     return {
       ...userEnvVars,
       BOUNDARY_PROXY_URL: proxyUrl,
@@ -196,14 +199,17 @@ export const apiKeysAtom = atom(
 );
 
 export const requiredApiKeysAtom = atom((get) => {
-  const { rt } = get(runtimeAtom);
-  if (rt === undefined) {
+  const { rt, lastValidRt } = get(runtimeAtom);
+  const runtime = rt || lastValidRt;
+
+  if (!runtime) {
     return [];
   }
-  const requiredEnvVars = rt.required_env_vars();
+
+  const requiredEnvVars = runtime.required_env_vars();
   const defaultEnvVars = ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY'];
   for (const e of defaultEnvVars) {
-    if (!requiredEnvVars.find((envVar) => e === envVar)) {
+    if (!requiredEnvVars.find((envVar: string) => e === envVar)) {
       requiredEnvVars.push(e);
     }
   }
@@ -215,18 +221,37 @@ const defaultEnvKeyValues: [string, string][] = (() => {
   if (typeof window === 'undefined') {
     return [];
   }
-  if ((window as any).next?.version) {
 
+  const baseDefaults: [string, string][] = [];
+
+  // Add proxy URL defaults based on environment
+  if ((window as any).next?.version) {
     const domain = window?.location?.origin || '';
     if (domain.includes('localhost')) {
       // we can do somehting fancier here later if we want to test locally.
-      return [['BOUNDARY_PROXY_URL', 'https://fiddle-proxy.fly.dev']];
+      baseDefaults.push(['BOUNDARY_PROXY_URL', 'https://fiddle-proxy.fly.dev']);
+    } else {
+      baseDefaults.push(['BOUNDARY_PROXY_URL', 'https://fiddle-proxy.fly.dev']);
     }
-    return [['BOUNDARY_PROXY_URL', 'https://fiddle-proxy.fly.dev']];
+  } else {
+    // VSCode environment
+    baseDefaults.push(['BOUNDARY_PROXY_URL', 'http://localhost:0000']);
+
+    // Add placeholder API keys for new VSCode users
+    // Check if this is a new user (no existing storage)
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const storedValue = window.localStorage.getItem('env-key-values');
+      if (!storedValue || storedValue === '[]') {
+        // New user - add placeholder keys
+        baseDefaults.push(['OPENAI_API_KEY', 'PLACEHOLDER_OPENAI_KEY']);
+        baseDefaults.push(['ANTHROPIC_API_KEY', 'PLACEHOLDER_ANTHROPIC_KEY']);
+        console.debug('New VSCode user detected - adding placeholder API keys');
+      }
+    }
   }
-  console.debug('Not running in a Next.js environment, set default value');
-  // Not running in a Next.js environment, set default value
-  return [['BOUNDARY_PROXY_URL', 'http://localhost:0000']];
+
+  console.debug('Default environment values:', baseDefaults);
+  return baseDefaults;
 })();
 
 
@@ -261,7 +286,7 @@ export const areApiKeysMissingAtom = atom((get) => {
   const isVscode = vscode.isVscode()
   if (!isVscode) return false
   const envVars = get(apiKeysAtom)
-  return requiredVars.length > 0 && requiredVars.some((key) => !envVars[key])
+  return requiredVars.length > 0 && requiredVars.some((key: string) => !envVars[key])
 })
 
 // Local state atoms for API key management
@@ -299,11 +324,11 @@ export const renderedApiKeysAtom = atom((get) => {
   );
 
   const missingVars = requiredApiKeys.filter(
-    (apiKey) => !(apiKey in localApiKeys),
+    (apiKey: string) => !(apiKey in localApiKeys),
   );
 
   vars.push(
-    ...missingVars.map((apiKey) => ({
+    ...missingVars.map((apiKey: string) => ({
       key: apiKey,
       value: undefined,
       required: true,
@@ -383,6 +408,10 @@ export const importApiKeysAtom = atom(
     set(hasLocalChangesAtom, true);
     // Mark imported keys as recently added
     set(recentlyAddedKeysAtom, (prev) => new Set([...prev, ...newKeys]));
+
+    const localApiKeys = get(localApiKeysAtom);
+    // Set this otherwise changes won't take effect.
+    set(userApiKeysAtom, localApiKeys);
   }
 );
 

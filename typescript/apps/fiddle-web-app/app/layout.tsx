@@ -1,3 +1,5 @@
+import '../lib/polyfills';
+import '@baml/ui/globals.css';
 import { Toaster } from '@baml/ui/sonner';
 import type { Metadata, Viewport } from 'next';
 import { Inter } from 'next/font/google';
@@ -5,7 +7,6 @@ import { Suspense } from 'react';
 import { ErrorBoundary } from 'react-error-boundary';
 import { PHProvider, RB2BElement } from './_components/PosthogProvider';
 import { ThemeProvider } from './_components/ThemeProvider';
-import '@baml/ui/globals.css';
 import { cn } from '@baml/ui/lib/utils';
 import PostHogPageView from './PostHogPageView';
 
@@ -37,7 +38,7 @@ export default function RootLayout({
       <PHProvider>
         <body
           className={cn(
-            'bg-background text-foreground relative min-h-screen font-sans antialiased',
+            'bg-background text-foreground relative h-screen font-sans antialiased',
             GeistSans.variable,
             GeistMono.variable,
           )}
@@ -52,7 +53,7 @@ export default function RootLayout({
             disableTransitionOnChange={true}
           >
             {/* <JotaiProvider> */}
-            <Suspense fallback={<div>Loading...</div>}>{children}</Suspense>
+            <Suspense fallback={null}>{children}</Suspense>
             {/* <div className="fixed left-0 bottom-1/2 w-[12%] px-1 items-center justify-center flex">
                 <BrowseSheet />
               </div> */}

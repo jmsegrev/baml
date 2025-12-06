@@ -97,6 +97,7 @@ pub fn parse_google_response<C: WithClient + RequestBuilder>(
             prompt_tokens: response.usage_metadata.prompt_token_count,
             output_tokens: response.usage_metadata.candidates_token_count,
             total_tokens: response.usage_metadata.total_token_count,
+            cached_input_tokens: response.usage_metadata.cached_content_token_count,
         },
     })
 }
@@ -168,6 +169,11 @@ pub fn scan_google_response_stream(
         }
     }
 
+    inner.metadata.prompt_tokens = event.usage_metadata.prompt_token_count;
+    inner.metadata.output_tokens = event.usage_metadata.candidates_token_count;
+    inner.metadata.total_tokens = event.usage_metadata.total_token_count;
+    inner.metadata.cached_input_tokens = event.usage_metadata.cached_content_token_count;
+
     inner.latency = instant_now.elapsed();
     Ok(())
 }
@@ -220,6 +226,39 @@ mod tests {
 }
         "#;
 
+    const FLASH_25_RESPONSE_STREAMING_RESPONSE: &str = r#"
+  {
+    "candidates": [
+      {
+        "content": {
+          "parts": [
+            {
+              "text": "I need the grounding documents to summarize them. Please provide the documents related to the query \"why not?\"."
+            }
+          ],
+          "role": "model"
+        },
+        "finishReason": "STOP",
+        "index": 0
+      }
+    ],
+    "usageMetadata": {
+      "promptTokenCount": 135,
+      "candidatesTokenCount": 21,
+      "totalTokenCount": 404,
+      "promptTokensDetails": [
+        {
+          "modality": "TEXT",
+          "tokenCount": 135
+        }
+      ],
+      "thoughtsTokenCount": 248
+    },
+    "modelVersion": "gemini-2.5-flash",
+    "responseId": "THqbaJaMOuCajMcP54G4qAE"
+    }
+    "#;
+
     #[test]
     fn test_json_deserialization() {
         let response: GoogleResponse = serde_json::from_str(RESPONSE).unwrap();
@@ -248,12 +287,19 @@ mod tests {
                 prompt_token_count: Some(166),
                 candidates_token_count: Some(39),
                 total_token_count: Some(205),
+                cached_content_token_count: None,
             },
         };
 
         let response_json = serde_json::to_string(&response).unwrap();
         let expected_json = serde_json::to_string(&expected).unwrap();
         assert_eq!(response_json, expected_json);
+    }
+
+    #[test]
+
+    fn test_flash25_streaming_deserialization() {
+        let _: GoogleResponse = serde_json::from_str(FLASH_25_RESPONSE_STREAMING_RESPONSE).unwrap();
     }
 
     #[test]
@@ -288,6 +334,7 @@ mod tests {
                 prompt_tokens: Some(166),
                 output_tokens: Some(39),
                 total_tokens: Some(205),
+                cached_input_tokens: None,
             },
         };
 

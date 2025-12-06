@@ -21,6 +21,151 @@ import (
 	"github.com/boundaryml/baml/engine/language_client_go/pkg/cffi"
 )
 
+type Union2AddTodoItemOrTodoMessageToUser struct {
+	variant string
+
+	variant_AddTodoItem *AddTodoItem
+
+	variant_TodoMessageToUser *TodoMessageToUser
+}
+
+func (u *Union2AddTodoItemOrTodoMessageToUser) Decode(holder *cffi.CFFIValueUnionVariant, typeMap baml.TypeMap) {
+	valueHolder := holder.Value
+	variantName := holder.VariantName
+	switch variantName {
+	case "AddTodoItem":
+		u.variant = "AddTodoItem"
+		value := baml.Decode(valueHolder).Interface().(AddTodoItem)
+		u.variant_AddTodoItem = &value
+	case "TodoMessageToUser":
+		u.variant = "TodoMessageToUser"
+		value := baml.Decode(valueHolder).Interface().(TodoMessageToUser)
+		u.variant_TodoMessageToUser = &value
+
+	default:
+		panic(fmt.Sprintf("invalid union variant: %s", variantName))
+	}
+}
+
+func (u Union2AddTodoItemOrTodoMessageToUser) Encode() (*cffi.CFFIValueHolder, error) {
+	switch u.variant {
+
+	case "AddTodoItem":
+		return baml.EncodeUnion(u.BamlEncodeName, "AddTodoItem", *u.variant_AddTodoItem)
+
+	case "TodoMessageToUser":
+		return baml.EncodeUnion(u.BamlEncodeName, "TodoMessageToUser", *u.variant_TodoMessageToUser)
+
+	case "":
+		return nil, fmt.Errorf("invalid union variant: [unset]")
+	}
+
+	return nil, fmt.Errorf("invalid union variant: %s", u.variant)
+}
+
+func (u Union2AddTodoItemOrTodoMessageToUser) BamlTypeName() string {
+	return "Union2AddTodoItemOrTodoMessageToUser"
+}
+
+func (u Union2AddTodoItemOrTodoMessageToUser) BamlEncodeName() *cffi.CFFITypeName {
+	return &cffi.CFFITypeName{
+		Name:      "Union__AddTodoItem__TodoMessageToUser",
+		Namespace: cffi.CFFITypeNamespace_TYPES,
+	}
+}
+
+func (u Union2AddTodoItemOrTodoMessageToUser) MarshalJSON() ([]byte, error) {
+	switch u.variant {
+
+	case "AddTodoItem":
+		return json.Marshal(u.variant_AddTodoItem)
+
+	case "TodoMessageToUser":
+		return json.Marshal(u.variant_TodoMessageToUser)
+
+	}
+
+	return nil, fmt.Errorf("invalid union variant: %s", u.variant)
+}
+
+func (u *Union2AddTodoItemOrTodoMessageToUser) UnmarshalJSON(data []byte) error {
+	var err error
+
+	err = json.Unmarshal(data, &u.variant_AddTodoItem)
+	if err == nil {
+		u.variant = "AddTodoItem"
+		return nil
+	} else {
+		u.variant_AddTodoItem = nil
+	}
+
+	err = json.Unmarshal(data, &u.variant_TodoMessageToUser)
+	if err == nil {
+		u.variant = "TodoMessageToUser"
+		return nil
+	} else {
+		u.variant_TodoMessageToUser = nil
+	}
+
+	return fmt.Errorf("invalid union variant: %s", string(data))
+}
+
+func Union2AddTodoItemOrTodoMessageToUser__NewAddTodoItem(v AddTodoItem) Union2AddTodoItemOrTodoMessageToUser {
+
+	return Union2AddTodoItemOrTodoMessageToUser{
+		variant:             "AddTodoItem",
+		variant_AddTodoItem: &v,
+	}
+}
+
+func (u *Union2AddTodoItemOrTodoMessageToUser) SetAddTodoItem(v AddTodoItem) {
+
+	u.variant = "AddTodoItem"
+	u.variant_AddTodoItem = &v
+
+	u.variant_TodoMessageToUser = nil
+
+}
+
+func (u *Union2AddTodoItemOrTodoMessageToUser) IsAddTodoItem() bool {
+	return u.variant == "AddTodoItem"
+}
+
+func (u *Union2AddTodoItemOrTodoMessageToUser) AsAddTodoItem() *AddTodoItem {
+	if u.variant != "AddTodoItem" {
+		return nil
+	}
+	return u.variant_AddTodoItem
+}
+
+func Union2AddTodoItemOrTodoMessageToUser__NewTodoMessageToUser(v TodoMessageToUser) Union2AddTodoItemOrTodoMessageToUser {
+
+	return Union2AddTodoItemOrTodoMessageToUser{
+		variant:                   "TodoMessageToUser",
+		variant_TodoMessageToUser: &v,
+	}
+}
+
+func (u *Union2AddTodoItemOrTodoMessageToUser) SetTodoMessageToUser(v TodoMessageToUser) {
+
+	u.variant = "TodoMessageToUser"
+	u.variant_TodoMessageToUser = &v
+
+	u.variant_AddTodoItem = nil
+
+}
+
+func (u *Union2AddTodoItemOrTodoMessageToUser) IsTodoMessageToUser() bool {
+	return u.variant == "TodoMessageToUser"
+}
+
+func (u *Union2AddTodoItemOrTodoMessageToUser) AsTodoMessageToUser() *TodoMessageToUser {
+	if u.variant != "TodoMessageToUser" {
+		return nil
+	}
+	return u.variant_TodoMessageToUser
+}
+
 type Union2BoolOrFloat struct {
 	variant string
 
@@ -889,151 +1034,6 @@ func (u *Union2FloatOrInt) AsFloat() *float64 {
 		return nil
 	}
 	return u.variant_Float
-}
-
-type Union2ImageOrString struct {
-	variant string
-
-	variant_Image *Image
-
-	variant_String *string
-}
-
-func (u *Union2ImageOrString) Decode(holder *cffi.CFFIValueUnionVariant, typeMap baml.TypeMap) {
-	valueHolder := holder.Value
-	variantName := holder.VariantName
-	switch variantName {
-	case "image":
-		u.variant = "Image"
-		value := baml.Decode(valueHolder).Interface().(Image)
-		u.variant_Image = &value
-	case "string":
-		u.variant = "String"
-		value := baml.Decode(valueHolder).Interface().(string)
-		u.variant_String = &value
-
-	default:
-		panic(fmt.Sprintf("invalid union variant: %s", variantName))
-	}
-}
-
-func (u Union2ImageOrString) Encode() (*cffi.CFFIValueHolder, error) {
-	switch u.variant {
-
-	case "Image":
-		return baml.EncodeUnion(u.BamlEncodeName, "image", *u.variant_Image)
-
-	case "String":
-		return baml.EncodeUnion(u.BamlEncodeName, "string", *u.variant_String)
-
-	case "":
-		return nil, fmt.Errorf("invalid union variant: [unset]")
-	}
-
-	return nil, fmt.Errorf("invalid union variant: %s", u.variant)
-}
-
-func (u Union2ImageOrString) BamlTypeName() string {
-	return "Union2ImageOrString"
-}
-
-func (u Union2ImageOrString) BamlEncodeName() *cffi.CFFITypeName {
-	return &cffi.CFFITypeName{
-		Name:      "Union__image__string",
-		Namespace: cffi.CFFITypeNamespace_TYPES,
-	}
-}
-
-func (u Union2ImageOrString) MarshalJSON() ([]byte, error) {
-	switch u.variant {
-
-	case "Image":
-		return json.Marshal(u.variant_Image)
-
-	case "String":
-		return json.Marshal(u.variant_String)
-
-	}
-
-	return nil, fmt.Errorf("invalid union variant: %s", u.variant)
-}
-
-func (u *Union2ImageOrString) UnmarshalJSON(data []byte) error {
-	var err error
-
-	err = json.Unmarshal(data, &u.variant_Image)
-	if err == nil {
-		u.variant = "Image"
-		return nil
-	} else {
-		u.variant_Image = nil
-	}
-
-	err = json.Unmarshal(data, &u.variant_String)
-	if err == nil {
-		u.variant = "String"
-		return nil
-	} else {
-		u.variant_String = nil
-	}
-
-	return fmt.Errorf("invalid union variant: %s", string(data))
-}
-
-func Union2ImageOrString__NewImage(v Image) Union2ImageOrString {
-
-	return Union2ImageOrString{
-		variant:       "Image",
-		variant_Image: &v,
-	}
-}
-
-func (u *Union2ImageOrString) SetImage(v Image) {
-
-	u.variant = "Image"
-	u.variant_Image = &v
-
-	u.variant_String = nil
-
-}
-
-func (u *Union2ImageOrString) IsImage() bool {
-	return u.variant == "Image"
-}
-
-func (u *Union2ImageOrString) AsImage() *Image {
-	if u.variant != "Image" {
-		return nil
-	}
-	return u.variant_Image
-}
-
-func Union2ImageOrString__NewString(v string) Union2ImageOrString {
-
-	return Union2ImageOrString{
-		variant:        "String",
-		variant_String: &v,
-	}
-}
-
-func (u *Union2ImageOrString) SetString(v string) {
-
-	u.variant = "String"
-	u.variant_String = &v
-
-	u.variant_Image = nil
-
-}
-
-func (u *Union2ImageOrString) IsString() bool {
-	return u.variant == "String"
-}
-
-func (u *Union2ImageOrString) AsString() *string {
-	if u.variant != "String" {
-		return nil
-	}
-	return u.variant_String
 }
 
 type Union2IntOrString struct {
@@ -3606,6 +3606,263 @@ func (u *Union3FloatOrIntOrString) AsFloat() *float64 {
 		return nil
 	}
 	return u.variant_Float
+}
+
+type Union4AudioOrImageOrPDFOrString struct {
+	variant string
+
+	variant_Image *Image
+
+	variant_String *string
+
+	variant_PDF *PDF
+
+	variant_Audio *Audio
+}
+
+func (u *Union4AudioOrImageOrPDFOrString) Decode(holder *cffi.CFFIValueUnionVariant, typeMap baml.TypeMap) {
+	valueHolder := holder.Value
+	variantName := holder.VariantName
+	switch variantName {
+	case "image":
+		u.variant = "Image"
+		value := baml.Decode(valueHolder).Interface().(Image)
+		u.variant_Image = &value
+	case "string":
+		u.variant = "String"
+		value := baml.Decode(valueHolder).Interface().(string)
+		u.variant_String = &value
+	case "pdf":
+		u.variant = "PDF"
+		value := baml.Decode(valueHolder).Interface().(PDF)
+		u.variant_PDF = &value
+	case "audio":
+		u.variant = "Audio"
+		value := baml.Decode(valueHolder).Interface().(Audio)
+		u.variant_Audio = &value
+
+	default:
+		panic(fmt.Sprintf("invalid union variant: %s", variantName))
+	}
+}
+
+func (u Union4AudioOrImageOrPDFOrString) Encode() (*cffi.CFFIValueHolder, error) {
+	switch u.variant {
+
+	case "Image":
+		return baml.EncodeUnion(u.BamlEncodeName, "image", *u.variant_Image)
+
+	case "String":
+		return baml.EncodeUnion(u.BamlEncodeName, "string", *u.variant_String)
+
+	case "PDF":
+		return baml.EncodeUnion(u.BamlEncodeName, "pdf", *u.variant_PDF)
+
+	case "Audio":
+		return baml.EncodeUnion(u.BamlEncodeName, "audio", *u.variant_Audio)
+
+	case "":
+		return nil, fmt.Errorf("invalid union variant: [unset]")
+	}
+
+	return nil, fmt.Errorf("invalid union variant: %s", u.variant)
+}
+
+func (u Union4AudioOrImageOrPDFOrString) BamlTypeName() string {
+	return "Union4AudioOrImageOrPDFOrString"
+}
+
+func (u Union4AudioOrImageOrPDFOrString) BamlEncodeName() *cffi.CFFITypeName {
+	return &cffi.CFFITypeName{
+		Name:      "Union__audio__image__pdf__string",
+		Namespace: cffi.CFFITypeNamespace_TYPES,
+	}
+}
+
+func (u Union4AudioOrImageOrPDFOrString) MarshalJSON() ([]byte, error) {
+	switch u.variant {
+
+	case "Image":
+		return json.Marshal(u.variant_Image)
+
+	case "String":
+		return json.Marshal(u.variant_String)
+
+	case "PDF":
+		return json.Marshal(u.variant_PDF)
+
+	case "Audio":
+		return json.Marshal(u.variant_Audio)
+
+	}
+
+	return nil, fmt.Errorf("invalid union variant: %s", u.variant)
+}
+
+func (u *Union4AudioOrImageOrPDFOrString) UnmarshalJSON(data []byte) error {
+	var err error
+
+	err = json.Unmarshal(data, &u.variant_Image)
+	if err == nil {
+		u.variant = "Image"
+		return nil
+	} else {
+		u.variant_Image = nil
+	}
+
+	err = json.Unmarshal(data, &u.variant_String)
+	if err == nil {
+		u.variant = "String"
+		return nil
+	} else {
+		u.variant_String = nil
+	}
+
+	err = json.Unmarshal(data, &u.variant_PDF)
+	if err == nil {
+		u.variant = "PDF"
+		return nil
+	} else {
+		u.variant_PDF = nil
+	}
+
+	err = json.Unmarshal(data, &u.variant_Audio)
+	if err == nil {
+		u.variant = "Audio"
+		return nil
+	} else {
+		u.variant_Audio = nil
+	}
+
+	return fmt.Errorf("invalid union variant: %s", string(data))
+}
+
+func Union4AudioOrImageOrPDFOrString__NewImage(v Image) Union4AudioOrImageOrPDFOrString {
+
+	return Union4AudioOrImageOrPDFOrString{
+		variant:       "Image",
+		variant_Image: &v,
+	}
+}
+
+func (u *Union4AudioOrImageOrPDFOrString) SetImage(v Image) {
+
+	u.variant = "Image"
+	u.variant_Image = &v
+
+	u.variant_String = nil
+
+	u.variant_PDF = nil
+
+	u.variant_Audio = nil
+
+}
+
+func (u *Union4AudioOrImageOrPDFOrString) IsImage() bool {
+	return u.variant == "Image"
+}
+
+func (u *Union4AudioOrImageOrPDFOrString) AsImage() *Image {
+	if u.variant != "Image" {
+		return nil
+	}
+	return u.variant_Image
+}
+
+func Union4AudioOrImageOrPDFOrString__NewString(v string) Union4AudioOrImageOrPDFOrString {
+
+	return Union4AudioOrImageOrPDFOrString{
+		variant:        "String",
+		variant_String: &v,
+	}
+}
+
+func (u *Union4AudioOrImageOrPDFOrString) SetString(v string) {
+
+	u.variant = "String"
+	u.variant_String = &v
+
+	u.variant_Image = nil
+
+	u.variant_PDF = nil
+
+	u.variant_Audio = nil
+
+}
+
+func (u *Union4AudioOrImageOrPDFOrString) IsString() bool {
+	return u.variant == "String"
+}
+
+func (u *Union4AudioOrImageOrPDFOrString) AsString() *string {
+	if u.variant != "String" {
+		return nil
+	}
+	return u.variant_String
+}
+
+func Union4AudioOrImageOrPDFOrString__NewPDF(v PDF) Union4AudioOrImageOrPDFOrString {
+
+	return Union4AudioOrImageOrPDFOrString{
+		variant:     "PDF",
+		variant_PDF: &v,
+	}
+}
+
+func (u *Union4AudioOrImageOrPDFOrString) SetPDF(v PDF) {
+
+	u.variant = "PDF"
+	u.variant_PDF = &v
+
+	u.variant_Image = nil
+
+	u.variant_String = nil
+
+	u.variant_Audio = nil
+
+}
+
+func (u *Union4AudioOrImageOrPDFOrString) IsPDF() bool {
+	return u.variant == "PDF"
+}
+
+func (u *Union4AudioOrImageOrPDFOrString) AsPDF() *PDF {
+	if u.variant != "PDF" {
+		return nil
+	}
+	return u.variant_PDF
+}
+
+func Union4AudioOrImageOrPDFOrString__NewAudio(v Audio) Union4AudioOrImageOrPDFOrString {
+
+	return Union4AudioOrImageOrPDFOrString{
+		variant:       "Audio",
+		variant_Audio: &v,
+	}
+}
+
+func (u *Union4AudioOrImageOrPDFOrString) SetAudio(v Audio) {
+
+	u.variant = "Audio"
+	u.variant_Audio = &v
+
+	u.variant_Image = nil
+
+	u.variant_String = nil
+
+	u.variant_PDF = nil
+
+}
+
+func (u *Union4AudioOrImageOrPDFOrString) IsAudio() bool {
+	return u.variant == "Audio"
+}
+
+func (u *Union4AudioOrImageOrPDFOrString) AsAudio() *Audio {
+	if u.variant != "Audio" {
+		return nil
+	}
+	return u.variant_Audio
 }
 
 type Union4BoolOrFloatOrIntOrString struct {

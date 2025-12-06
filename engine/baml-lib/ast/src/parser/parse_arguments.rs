@@ -2,7 +2,7 @@ use internal_baml_diagnostics::Diagnostics;
 
 use super::{
     helpers::{parsing_catch_all, Pair},
-    parse_expression::parse_expression,
+    parse_expression::{parse_config_expression, parse_expression},
     Rule,
 };
 use crate::ast::{self, Identifier};
@@ -27,7 +27,15 @@ pub(crate) fn parse_arguments_list(
                     });
                 }
             }
-            _ => parsing_catch_all(current, "attribute arguments"),
+            Rule::config_expression => {
+                if let Some(parsed_value) = parse_config_expression(current, diagnostics) {
+                    arguments.arguments.push(ast::Argument {
+                        value: parsed_value,
+                        span: diagnostics.span(current_span),
+                    });
+                }
+            }
+            _ => parsing_catch_all(current, "attribute arguments", diagnostics),
         }
     }
 }

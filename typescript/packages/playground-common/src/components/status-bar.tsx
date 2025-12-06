@@ -9,11 +9,8 @@ import {
 import { useAtomValue } from 'jotai';
 import { AlertTriangle, CheckCircle, XCircle } from 'lucide-react';
 import { useEffect, useState } from 'react';
-import {
-  bamlCliVersionAtom,
-  numErrorsAtom,
-  versionAtom,
-} from '../baml_wasm_web/EventListener';
+import { bamlCliVersionAtom } from '../baml_wasm_web/EventListener';
+import { useBAMLSDK } from '../sdk';
 import { ErrorWarningDialog } from './ErrorWarningDialog';
 
 const BreakpointBadge: React.FC = () => {
@@ -101,7 +98,8 @@ const BreakpointBadge: React.FC = () => {
 };
 
 const ErrorCount: React.FC<{ onClick?: () => void }> = ({ onClick }) => {
-  const { errors, warnings } = useAtomValue(numErrorsAtom);
+  const sdk = useBAMLSDK();
+  const { errors, warnings } = useAtomValue(sdk.atoms.numErrorsAtom);
   if (errors === 0 && warnings === 0) {
     return (
       <div className="flex flex-row gap-1 items-center text-green-600">
@@ -135,8 +133,9 @@ const ErrorCount: React.FC<{ onClick?: () => void }> = ({ onClick }) => {
 };
 
 export const StatusBar: React.FC = () => {
+  const sdk = useBAMLSDK();
   const bamlCliVersion = useAtomValue(bamlCliVersionAtom);
-  const version = useAtomValue(versionAtom);
+  const version = useAtomValue(sdk.atoms.versionAtom);
   const [showDialog, setShowDialog] = useState(false);
 
   return (
@@ -146,7 +145,7 @@ export const StatusBar: React.FC = () => {
         {bamlCliVersion && (
           <div className="text-muted-foreground">baml-cli {bamlCliVersion}</div>
         )}
-        <div className="text-muted-foreground">VSCode Runtime: {version}</div>
+        <div className="text-muted-foreground">BAML playground: {version}</div>
 
         <ErrorCount onClick={() => setShowDialog(true)} />
         <ErrorWarningDialog open={showDialog} onOpenChange={setShowDialog} />

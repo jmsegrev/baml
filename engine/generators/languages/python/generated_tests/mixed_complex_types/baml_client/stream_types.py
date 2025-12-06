@@ -140,7 +140,7 @@ class NodeMetadata(BaseModel):
     created: typing.Optional[str] = None
     modified: typing.Optional[str] = None
     tags: typing.List[str]
-    attributes: typing.Dict[str, typing.Union[str, int, bool]]
+    attributes: typing.Dict[str, typing.Optional[typing.Union[str, int, bool]]]
 
 class PrimaryData(BaseModel):
     values: typing.List[typing.Union[str, int, float]]
@@ -149,7 +149,7 @@ class PrimaryData(BaseModel):
 
 class Record(BaseModel):
     id: typing.Optional[int] = None
-    data: typing.Dict[str, typing.Union[str, int, bool]]
+    data: typing.Dict[str, typing.Optional[typing.Union[str, int, bool]]]
     related: typing.Optional[typing.List["Record"]] = None
 
 class ResponseMetadata(BaseModel):
@@ -227,7 +227,7 @@ class Widget(BaseModel):
     type: typing.Optional[typing.Union[str, str, str, str]] = None
     button: typing.Optional["ButtonWidget"] = None
     text: typing.Optional["TextWidget"] = None
-    image: typing.Optional["ImageWidget"] = None
+    img: typing.Optional["ImageWidget"] = None
     container: typing.Optional["ContainerWidget"] = None
 
 # #########################################################################

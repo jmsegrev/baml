@@ -1,19 +1,26 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, time::SystemTime};
 
-use baml_runtime::{
-    on_log_event::LogEvent, runtime_interface::ExperimentalTracingInterface,
-    BamlRuntime as CoreRuntime,
-};
+// Conditional runtime selection based on the "thir-interpreter" feature flag
+use baml_compiler::watch::shared_handler;
+#[cfg(feature = "thir-interpreter")]
+pub use baml_runtime::async_interpreter_runtime::BamlAsyncInterpreterRuntime as CoreBamlRuntime;
+#[cfg(not(feature = "thir-interpreter"))]
+pub use baml_runtime::async_vm_runtime::BamlAsyncVmRuntime as CoreBamlRuntime;
+use baml_runtime::{on_log_event::LogEvent, runtime_interface::ExperimentalTracingInterface};
 use baml_types::BamlValue;
 use napi::{
-    bindgen_prelude::ObjectFinalize,
+    bindgen_prelude::{
+        FnArgs, FromNapiValue, Function, FunctionRef, JsObjectValue, Object, ObjectFinalize,
+        Promise, PromiseRaw, ToNapiValue, Undefined, Unknown,
+    },
     threadsafe_function::{ThreadSafeCallContext, ThreadsafeFunctionCallMode},
-    Env, JsFunction, JsObject, JsUndefined,
+    Env, Error, JsString,
 };
 use napi_derive::napi;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    abort_controller::js_abort_signal_to_rust_tripwire,
     errors::{from_anyhow_error, invalid_argument_error},
     parse_ts_types,
     types::{
@@ -24,11 +31,13 @@ use crate::{
     },
 };
 
+type LogEventCallbackArgs = FnArgs<(Option<Error>, BamlLogEvent)>;
+
 crate::lang_wrapper!(BamlRuntime,
-    CoreRuntime,
+    CoreBamlRuntime,
     clone_safe,
     custom_finalize,
-    callback: Option<napi::Ref<()>> = None
+    callback: Option<FunctionRef<LogEventCallbackArgs, ()>> = None
 );
 
 #[napi(object)]
@@ -50,6 +59,239 @@ pub struct BamlLogEvent {
     pub start_time: String,
 }
 
+// Emit event types matching the generated events.ts
+#[napi(object)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BlockEvent {
+    pub block_label: String,
+    pub event_type: String, // "enter" | "exit"
+}
+
+#[napi(object)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct VarEvent {
+    pub variable_name: String,
+    pub value: serde_json::Value, // Serialized BamlValue
+    pub timestamp: String,
+    pub function_name: String,
+}
+
+// Simple stream event that will be pushed through threadsafe function
+#[napi(object)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct StreamEvent {
+    pub stream_id: String,
+    pub event_type: String,               // "start" | "update" | "end"
+    pub value: Option<serde_json::Value>, // Only present for "update"
+}
+
+// Storage for event handlers extracted from EventCollector
+// Using the full ThreadsafeFunction type with all generics to match what build_threadsafe_function creates
+struct EmitCallbacks {
+    var_handlers: HashMap<
+        String,
+        napi::threadsafe_function::ThreadsafeFunction<
+            VarEvent,
+            napi::Unknown<'static>,
+            VarEvent,
+            napi::Status,
+            false,
+        >,
+    >,
+    stream_handlers: HashMap<
+        String,
+        napi::threadsafe_function::ThreadsafeFunction<
+            StreamEvent,
+            napi::Unknown<'static>,
+            StreamEvent,
+            napi::Status,
+            false,
+        >,
+    >,
+    block_handlers: Vec<
+        napi::threadsafe_function::ThreadsafeFunction<
+            BlockEvent,
+            napi::Unknown<'static>,
+            BlockEvent,
+            napi::Status,
+            false,
+        >,
+    >,
+}
+
+// Helper function to recursively extract handlers from a bindings object
+fn extract_handlers_recursive(
+    bindings: &Object,
+    var_handlers: &mut HashMap<
+        String,
+        napi::threadsafe_function::ThreadsafeFunction<
+            VarEvent,
+            Unknown<'static>,
+            VarEvent,
+            napi::Status,
+            false,
+        >,
+    >,
+    stream_handlers: &mut HashMap<
+        String,
+        napi::threadsafe_function::ThreadsafeFunction<
+            StreamEvent,
+            Unknown<'static>,
+            StreamEvent,
+            napi::Status,
+            false,
+        >,
+    >,
+    block_handlers: &mut Vec<
+        napi::threadsafe_function::ThreadsafeFunction<
+            BlockEvent,
+            Unknown<'static>,
+            BlockEvent,
+            napi::Status,
+            false,
+        >,
+    >,
+) -> napi::Result<()> {
+    // Get the function name from this bindings object
+    let current_function_name = bindings
+        .get_named_property::<String>("functionName")
+        .unwrap_or_default();
+
+    // Extract block handlers from this level
+    if let Ok(block_array) = bindings.get_named_property::<Vec<Function>>("block") {
+        for handler in block_array {
+            if let Ok(tsfn) = handler
+                .build_threadsafe_function()
+                .weak::<false>()
+                .build_callback(|ctx: ThreadSafeCallContext<BlockEvent>| Ok(ctx.value))
+            {
+                block_handlers.push(tsfn);
+            }
+        }
+    }
+
+    // Extract var handlers from this level
+    if let Ok(vars_obj) = bindings.get_named_property::<Object>("vars") {
+        if let Ok(keys) = vars_obj.get_property_names() {
+            let num_keys = keys.get_array_length()?;
+            for i in 0..num_keys {
+                if let Ok(key_str) = keys.get_element::<JsString>(i) {
+                    let var_name = key_str.into_utf8()?.as_str()?.to_string();
+                    if let Ok(handler_array) =
+                        vars_obj.get_named_property::<Vec<Function>>(&var_name)
+                    {
+                        if let Some(handler) = handler_array.first() {
+                            if let Ok(tsfn) = handler
+                                .build_threadsafe_function()
+                                .weak::<false>()
+                                .build_callback(
+                                    |ctx: ThreadSafeCallContext<VarEvent>| Ok(ctx.value),
+                                )
+                            {
+                                // Key by "FunctionName.variable_name"
+                                let key = format!("{current_function_name}.{var_name}");
+                                var_handlers.insert(key, tsfn);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Extract stream handlers from this level
+    if let Ok(streams_obj) = bindings.get_named_property::<Object>("streams") {
+        if let Ok(keys) = streams_obj.get_property_names() {
+            let num_keys = keys.get_array_length()?;
+            for i in 0..num_keys {
+                if let Ok(key_str) = keys.get_element::<JsString>(i) {
+                    let var_name = key_str.into_utf8()?.as_str()?.to_string();
+                    if let Ok(handler_array) =
+                        streams_obj.get_named_property::<Vec<Function>>(&var_name)
+                    {
+                        if let Some(handler) = handler_array.first() {
+                            if let Ok(tsfn) = handler
+                                .build_threadsafe_function()
+                                .weak::<false>()
+                                .build_callback(|ctx: ThreadSafeCallContext<StreamEvent>| {
+                                    Ok(ctx.value)
+                                })
+                            {
+                                // Key by "FunctionName.variable_name"
+                                let key = format!("{current_function_name}.{var_name}");
+                                stream_handlers.insert(key, tsfn);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Recursively extract from nested functions
+    if let Ok(functions_obj) = bindings.get_named_property::<Object>("functions") {
+        if let Ok(keys) = functions_obj.get_property_names() {
+            let num_keys = keys.get_array_length()?;
+            for i in 0..num_keys {
+                if let Ok(key_str) = keys.get_element::<JsString>(i) {
+                    let _child_fn_name = key_str.into_utf8()?.as_str()?.to_string();
+                    if let Ok(child_bindings) =
+                        functions_obj.get_named_property::<Object>(&_child_fn_name)
+                    {
+                        // Recursively extract from child function's bindings
+                        extract_handlers_recursive(
+                            &child_bindings,
+                            var_handlers,
+                            stream_handlers,
+                            block_handlers,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// Extract event handlers from the EventCollector.__handlers() result
+fn extract_emit_callbacks(env: &Env, events_obj: &Object) -> napi::Result<Option<EmitCallbacks>> {
+    // Call __handlers() method to get InternalEventBindings
+    let handlers_fn: Function = match events_obj.get_named_property("__handlers") {
+        Ok(f) => {
+            log::debug!("Found __handlers function");
+            f
+        }
+        Err(e) => {
+            log::debug!("No __handlers function found: {e:?}");
+            return Ok(None);
+        }
+    };
+
+    // Call the function with `this` set to events_obj and no arguments
+    let empty_args = env.create_array(0)?;
+    let bindings_result: Unknown = handlers_fn.apply(events_obj, empty_args.into_unknown(env)?)?;
+    let bindings: Object = Object::from_unknown(bindings_result)?;
+
+    let mut var_handlers = HashMap::new();
+    let mut stream_handlers = HashMap::new();
+    let mut block_handlers = Vec::new();
+
+    // Recursively extract all handlers including nested functions
+    extract_handlers_recursive(
+        &bindings,
+        &mut var_handlers,
+        &mut stream_handlers,
+        &mut block_handlers,
+    )?;
+
+    Ok(Some(EmitCallbacks {
+        var_handlers,
+        stream_handlers,
+        block_handlers,
+    }))
+}
+
 #[napi]
 impl BamlRuntime {
     #[napi(ts_return_type = "BamlRuntime")]
@@ -58,7 +300,7 @@ impl BamlRuntime {
         env_vars: HashMap<String, String>,
     ) -> napi::Result<Self> {
         let directory = PathBuf::from(directory);
-        Ok(CoreRuntime::from_directory(&directory, env_vars)
+        Ok(CoreBamlRuntime::from_directory(&directory, env_vars)
             .map_err(from_anyhow_error)?
             .into())
     }
@@ -73,9 +315,11 @@ impl BamlRuntime {
             .into_iter()
             .filter_map(|(key, value)| value.map(|value| (key, value)))
             .collect();
-        Ok(CoreRuntime::from_file_content(&root_path, &files, env_vars)
-            .map_err(from_anyhow_error)?
-            .into())
+        Ok(
+            CoreBamlRuntime::from_file_content(&root_path, &files, env_vars)
+                .map_err(from_anyhow_error)?
+                .into(),
+        )
     }
 
     #[napi]
@@ -85,7 +329,7 @@ impl BamlRuntime {
         files: HashMap<String, String>,
         env_vars: HashMap<String, String>,
     ) -> napi::Result<()> {
-        self.inner = CoreRuntime::from_file_content(&root_path, &files, env_vars)
+        self.inner = CoreBamlRuntime::from_file_content(&root_path, &files, env_vars)
             .map_err(from_anyhow_error)?
             .into();
         Ok(())
@@ -99,17 +343,20 @@ impl BamlRuntime {
     }
 
     #[napi(ts_return_type = "Promise<FunctionResult>")]
-    pub fn call_function(
+    pub fn call_function<'e>(
         &self,
-        env: Env,
+        env: &'e Env,
         function_name: String,
-        #[napi(ts_arg_type = "{ [name: string]: any }")] args: JsObject,
+        #[napi(ts_arg_type = "{ [name: string]: any }")] args: Object,
         ctx: &RuntimeContextManager,
         tb: Option<&TypeBuilder>,
         cb: Option<&ClientRegistry>,
         collectors: Vec<&Collector>,
+        tags: HashMap<String, String>,
         env_vars: HashMap<String, String>,
-    ) -> napi::Result<JsObject> {
+        signal: Option<Object>,   // AbortSignal parameter
+        watchers: Option<Object>, // EventCollector parameter
+    ) -> napi::Result<PromiseRaw<'e, FunctionResult>> {
         let args = parse_ts_types::js_object_to_baml_value(env, args)?;
 
         if !args.is_map() {
@@ -119,6 +366,16 @@ impl BamlRuntime {
             )));
         }
         let args_map = args.as_map_owned().unwrap();
+
+        // Convert AbortSignal to Tripwire
+        let tripwire = js_abort_signal_to_rust_tripwire(env, signal)?;
+
+        // Extract emit callbacks from EventCollector
+        let emit_callbacks = if let Some(ref watchers_obj) = watchers {
+            extract_emit_callbacks(env, watchers_obj)?
+        } else {
+            None
+        };
 
         let baml_runtime = self.inner.clone();
         let ctx_mng = ctx.inner.clone();
@@ -130,7 +387,147 @@ impl BamlRuntime {
             .map(|c| c.inner.clone())
             .collect::<Vec<_>>();
 
+        let function_name_clone = function_name.clone();
+
         let fut = async move {
+            // Create emit_handler closure
+            let watch_handler = shared_handler(move |notification| {
+                if let Some(ref callbacks) = emit_callbacks {
+                    match notification.value {
+                        baml_compiler::watch::WatchBamlValue::Header(header) => {
+                            // Fire block events to all registered block handlers
+                            for handler in &callbacks.block_handlers {
+                                let block_event = BlockEvent {
+                                    block_label: header.title.clone(),
+                                    event_type: "enter".to_string(),
+                                };
+                                let _ = handler
+                                    .call(block_event, ThreadsafeFunctionCallMode::NonBlocking);
+                            }
+                        }
+                        // HACK: HeaderStopped is emitted synthetically when a new header
+                        // comes in at the same or shallower level
+                        baml_compiler::watch::WatchBamlValue::HeaderStopped(header) => {
+                            // Fire block exit events to all registered block handlers
+                            for handler in &callbacks.block_handlers {
+                                let block_event = BlockEvent {
+                                    block_label: header.title.clone(),
+                                    event_type: "exit".to_string(),
+                                };
+                                let _ = handler
+                                    .call(block_event, ThreadsafeFunctionCallMode::NonBlocking);
+                            }
+                        }
+                        baml_compiler::watch::WatchBamlValue::Value(value) => {
+                            if let Some(var_name) = &notification.variable_name {
+                                // Serialize BamlValue to JSON
+                                let serialized = serde_json::to_value(value.value())
+                                    .unwrap_or(serde_json::Value::Null);
+
+                                let var_event = VarEvent {
+                                    variable_name: var_name.clone(),
+                                    value: serialized,
+                                    timestamp: SystemTime::now()
+                                        .duration_since(SystemTime::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_millis()
+                                        .to_string(),
+                                    function_name: notification.function_name.clone(),
+                                };
+
+                                // Fire to var handlers using composite key "FunctionName.channel_name"
+                                // Use channel_name if available, otherwise fall back to variable_name
+                                let channel =
+                                    notification.channel_name.as_ref().unwrap_or(var_name);
+                                let handler_key =
+                                    format!("{}.{}", notification.function_name, channel);
+                                if let Some(handler) = callbacks.var_handlers.get(&handler_key) {
+                                    let _ = handler
+                                        .call(var_event, ThreadsafeFunctionCallMode::NonBlocking);
+                                }
+                            }
+                        }
+                        baml_compiler::watch::WatchBamlValue::StreamStart(stream_id) => {
+                            log::info!(
+                                "[RUST] StreamStart notification for var: {:?}, stream_id: {}",
+                                notification.variable_name,
+                                stream_id
+                            );
+                            if let Some(var_name) = &notification.variable_name {
+                                log::info!(
+                                    "[RUST] Stream handlers available: {:?}",
+                                    callbacks.stream_handlers.keys().collect::<Vec<_>>()
+                                );
+                                let channel =
+                                    notification.channel_name.as_ref().unwrap_or(var_name);
+                                let handler_key =
+                                    format!("{}.{}", notification.function_name, channel);
+                                if let Some(handler) = callbacks.stream_handlers.get(&handler_key) {
+                                    log::info!(
+                                        "[RUST] Found stream handler for {var_name}, calling it"
+                                    );
+                                    let stream_event = StreamEvent {
+                                        stream_id: stream_id.clone(),
+                                        event_type: "start".to_string(),
+                                        value: None,
+                                    };
+                                    let result = handler.call(
+                                        stream_event,
+                                        ThreadsafeFunctionCallMode::NonBlocking,
+                                    );
+                                    log::info!("[RUST] Handler call result: {result:?}");
+                                } else {
+                                    log::info!(
+                                        "[RUST] No stream handler found for channel: {var_name}"
+                                    );
+                                }
+                            }
+                        }
+                        baml_compiler::watch::WatchBamlValue::StreamUpdate(stream_id, value) => {
+                            if let Some(var_name) = &notification.variable_name {
+                                let channel =
+                                    notification.channel_name.as_ref().unwrap_or(var_name);
+                                let handler_key =
+                                    format!("{}.{}", notification.function_name, channel);
+                                if let Some(handler) = callbacks.stream_handlers.get(&handler_key) {
+                                    let serialized = serde_json::to_value(value.value())
+                                        .unwrap_or(serde_json::Value::Null);
+
+                                    let stream_event = StreamEvent {
+                                        stream_id: stream_id.clone(),
+                                        event_type: "update".to_string(),
+                                        value: Some(serialized),
+                                    };
+                                    let _ = handler.call(
+                                        stream_event,
+                                        ThreadsafeFunctionCallMode::NonBlocking,
+                                    );
+                                }
+                            }
+                        }
+                        baml_compiler::watch::WatchBamlValue::StreamEnd(stream_id) => {
+                            if let Some(var_name) = &notification.variable_name {
+                                let channel =
+                                    notification.channel_name.as_ref().unwrap_or(var_name);
+                                let handler_key =
+                                    format!("{}.{}", notification.function_name, channel);
+                                if let Some(handler) = callbacks.stream_handlers.get(&handler_key) {
+                                    let stream_event = StreamEvent {
+                                        stream_id: stream_id.clone(),
+                                        event_type: "end".to_string(),
+                                        value: None,
+                                    };
+                                    let _ = handler.call(
+                                        stream_event,
+                                        ThreadsafeFunctionCallMode::NonBlocking,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
             let result = baml_runtime
                 .call_function(
                     function_name,
@@ -140,6 +537,9 @@ impl BamlRuntime {
                     cb.as_ref(),
                     Some(collector_list),
                     env_vars,
+                    Some(&tags),
+                    tripwire,
+                    Some(watch_handler),
                 )
                 .await;
 
@@ -149,7 +549,7 @@ impl BamlRuntime {
                 .map_err(from_anyhow_error)
         };
 
-        env.execute_tokio_future(fut, |&mut _, data| Ok(data))
+        env.spawn_future(fut)
     }
 
     #[napi]
@@ -157,14 +557,18 @@ impl BamlRuntime {
         &self,
         env: Env,
         function_name: String,
-        #[napi(ts_arg_type = "{ [name: string]: any }")] args: JsObject,
+        #[napi(ts_arg_type = "{ [name: string]: any }")] args: Object,
         ctx: &RuntimeContextManager,
         tb: Option<&TypeBuilder>,
         cb: Option<&ClientRegistry>,
         collectors: Vec<&Collector>,
+        tags: HashMap<String, String>,
         env_vars: HashMap<String, String>,
+        signal: Option<Object>,   // AbortSignal parameter
+        watchers: Option<Object>, // EventCollector parameter
     ) -> napi::Result<FunctionResult> {
-        let args = parse_ts_types::js_object_to_baml_value(env, args)?;
+        let args = parse_ts_types::js_object_to_baml_value(&env, args)?;
+        let tripwire = js_abort_signal_to_rust_tripwire(&env, signal)?;
 
         if !args.is_map() {
             return Err(invalid_argument_error(&format!(
@@ -174,6 +578,13 @@ impl BamlRuntime {
         }
         let args_map = args.as_map_owned().unwrap();
 
+        // Extract emit callbacks from EventCollector
+        let emit_callbacks = if let Some(ref watchers_obj) = watchers {
+            extract_emit_callbacks(&env, watchers_obj)?
+        } else {
+            None
+        };
+
         let ctx_mng = ctx.inner.clone();
         let tb = tb.map(|tb| tb.inner.clone());
         let cb = cb.map(|cb| cb.inner.clone());
@@ -181,15 +592,143 @@ impl BamlRuntime {
             .into_iter()
             .map(|c| c.inner.clone())
             .collect::<Vec<_>>();
-        let (result, _event_id) = self.inner.call_function_sync(
-            function_name,
-            &args_map,
-            &ctx_mng,
-            tb.as_ref(),
-            cb.as_ref(),
-            Some(collector_list),
-            env_vars,
-        );
+
+        let (result, _event_id) = {
+            let watch_handler = shared_handler(move |notification| {
+                if let Some(ref callbacks) = emit_callbacks {
+                    match notification.value {
+                        baml_compiler::watch::WatchBamlValue::Header(header) => {
+                            // Fire block events to all registered block handlers
+                            for handler in &callbacks.block_handlers {
+                                let block_event = BlockEvent {
+                                    block_label: header.title.clone(),
+                                    event_type: "enter".to_string(),
+                                };
+                                let _ = handler.call(
+                                    block_event,
+                                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                                );
+                            }
+                        }
+                        // HACK: HeaderStopped is emitted synthetically when a new header
+                        // comes in at the same or shallower level
+                        baml_compiler::watch::WatchBamlValue::HeaderStopped(header) => {
+                            // Fire block exit events to all registered block handlers
+                            for handler in &callbacks.block_handlers {
+                                let block_event = BlockEvent {
+                                    block_label: header.title.clone(),
+                                    event_type: "exit".to_string(),
+                                };
+                                let _ = handler.call(
+                                    block_event,
+                                    napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                                );
+                            }
+                        }
+                        baml_compiler::watch::WatchBamlValue::Value(value) => {
+                            if let Some(var_name) = &notification.variable_name {
+                                let channel =
+                                    notification.channel_name.as_ref().unwrap_or(var_name);
+                                let handler_key =
+                                    format!("{}.{}", notification.function_name, channel);
+                                if let Some(handler) = callbacks.var_handlers.get(&handler_key) {
+                                    let serialized = serde_json::to_value(value.value())
+                                        .unwrap_or(serde_json::Value::Null);
+
+                                    let var_event = VarEvent {
+                                        variable_name: var_name.clone(),
+                                        value: serialized,
+                                        timestamp: SystemTime::now()
+                                            .duration_since(SystemTime::UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_millis()
+                                            .to_string(),
+                                        function_name: notification.function_name.clone(),
+                                    };
+                                    let _ = handler.call(
+                                        var_event,
+                                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                                    );
+                                }
+                            }
+                        }
+                        baml_compiler::watch::WatchBamlValue::StreamStart(stream_id) => {
+                            if let Some(var_name) = &notification.variable_name {
+                                let channel =
+                                    notification.channel_name.as_ref().unwrap_or(var_name);
+                                let handler_key =
+                                    format!("{}.{}", notification.function_name, channel);
+                                if let Some(handler) = callbacks.stream_handlers.get(&handler_key) {
+                                    let stream_event = StreamEvent {
+                                        stream_id: stream_id.clone(),
+                                        event_type: "start".to_string(),
+                                        value: None,
+                                    };
+                                    let _ = handler.call(
+                                        stream_event,
+                                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                                    );
+                                }
+                            }
+                        }
+                        baml_compiler::watch::WatchBamlValue::StreamUpdate(stream_id, value) => {
+                            if let Some(var_name) = &notification.variable_name {
+                                let channel =
+                                    notification.channel_name.as_ref().unwrap_or(var_name);
+                                let handler_key =
+                                    format!("{}.{}", notification.function_name, channel);
+                                if let Some(handler) = callbacks.stream_handlers.get(&handler_key) {
+                                    let serialized = serde_json::to_value(value.value())
+                                        .unwrap_or(serde_json::Value::Null);
+
+                                    let stream_event = StreamEvent {
+                                        stream_id: stream_id.clone(),
+                                        event_type: "update".to_string(),
+                                        value: Some(serialized),
+                                    };
+                                    let _ = handler.call(
+                                        stream_event,
+                                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                                    );
+                                }
+                            }
+                        }
+                        baml_compiler::watch::WatchBamlValue::StreamEnd(stream_id) => {
+                            if let Some(var_name) = &notification.variable_name {
+                                let channel =
+                                    notification.channel_name.as_ref().unwrap_or(var_name);
+                                let handler_key =
+                                    format!("{}.{}", notification.function_name, channel);
+                                if let Some(handler) = callbacks.stream_handlers.get(&handler_key) {
+                                    let stream_event = StreamEvent {
+                                        stream_id: stream_id.clone(),
+                                        event_type: "end".to_string(),
+                                        value: None,
+                                    };
+                                    let _ = handler.call(
+                                        stream_event,
+                                        napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            self.inner.call_function_sync(
+                function_name,
+                &args_map,
+                &ctx_mng,
+                tb.as_ref(),
+                cb.as_ref(),
+                Some(collector_list),
+                env_vars,
+                Some(&tags),
+                tripwire,
+                Some(watch_handler),
+            )
+        };
 
         result.map(FunctionResult::from).map_err(from_anyhow_error)
     }
@@ -199,17 +738,20 @@ impl BamlRuntime {
         &self,
         env: Env,
         function_name: String,
-        #[napi(ts_arg_type = "{ [name: string]: any }")] args: JsObject,
+        #[napi(ts_arg_type = "{ [name: string]: any }")] args: Object,
         #[napi(ts_arg_type = "((err: any, param: FunctionResult) => void) | undefined")] cb: Option<
-            JsFunction,
+            Function<FnArgs<(Error, FunctionResult)>, ()>,
         >,
         ctx: &RuntimeContextManager,
         tb: Option<&TypeBuilder>,
         client_registry: Option<&ClientRegistry>,
         collectors: Vec<&Collector>,
+        tags: HashMap<String, String>,
         env_vars: HashMap<String, String>,
+        signal: Option<Object>, // NEW: AbortSignal parameter
+        #[napi(ts_arg_type = "(() => void) | undefined")] on_tick: Option<Function<(), ()>>,
     ) -> napi::Result<FunctionResultStream> {
-        let args: BamlValue = parse_ts_types::js_object_to_baml_value(env, args)?;
+        let args: BamlValue = parse_ts_types::js_object_to_baml_value(&env, args)?;
         if !args.is_map() {
             return Err(invalid_argument_error(&format!(
                 "Expected a map of arguments, got: {}",
@@ -217,6 +759,8 @@ impl BamlRuntime {
             )));
         }
         let args_map = args.as_map_owned().unwrap();
+
+        let tripwire = js_abort_signal_to_rust_tripwire(&env, signal)?;
 
         let ctx = ctx.inner.clone();
         let tb = tb.map(|tb| tb.inner.clone());
@@ -235,15 +779,28 @@ impl BamlRuntime {
                 client_registry.as_ref(),
                 Some(collector_list),
                 env_vars,
+                tripwire,
+                Some(&tags),
             )
             .map_err(from_anyhow_error)?;
 
         let cb = match cb {
-            Some(cb) => Some(env.create_reference(cb)?),
+            Some(func) => Some(func.create_ref()?),
             None => None,
         };
 
-        Ok(FunctionResultStream::new(stream, cb, tb, client_registry))
+        let on_tick = match on_tick {
+            Some(tick_cb) => Some(tick_cb.create_ref()?),
+            None => None,
+        };
+
+        Ok(FunctionResultStream::new(
+            stream,
+            cb,
+            on_tick,
+            tb,
+            client_registry,
+        ))
     }
 
     #[napi]
@@ -251,17 +808,20 @@ impl BamlRuntime {
         &self,
         env: Env,
         function_name: String,
-        #[napi(ts_arg_type = "{ [name: string]: any }")] args: JsObject,
+        #[napi(ts_arg_type = "{ [name: string]: any }")] args: Object,
         #[napi(ts_arg_type = "((err: any, param: FunctionResult) => void) | undefined")] cb: Option<
-            JsFunction,
+            Function<FnArgs<(Error, FunctionResult)>, ()>,
         >,
         ctx: &RuntimeContextManager,
         tb: Option<&TypeBuilder>,
         client_registry: Option<&ClientRegistry>,
         collectors: Vec<&Collector>,
+        tags: HashMap<String, String>,
         env_vars: HashMap<String, String>,
+        signal: Option<Object>, // NEW: AbortSignal parameter
+        #[napi(ts_arg_type = "(() => void) | undefined")] on_tick: Option<Function<(), ()>>,
     ) -> napi::Result<FunctionResultStream> {
-        let args: BamlValue = parse_ts_types::js_object_to_baml_value(env, args)?;
+        let args: BamlValue = parse_ts_types::js_object_to_baml_value(&env, args)?;
         if !args.is_map() {
             return Err(invalid_argument_error(&format!(
                 "Expected a map of arguments, got: {}",
@@ -277,6 +837,7 @@ impl BamlRuntime {
             .into_iter()
             .map(|c| c.inner.clone())
             .collect::<Vec<_>>();
+        let tripwire = js_abort_signal_to_rust_tripwire(&env, signal)?;
         let stream = self
             .inner
             .stream_function(
@@ -287,29 +848,42 @@ impl BamlRuntime {
                 client_registry.as_ref(),
                 Some(collector_list),
                 env_vars,
+                tripwire,
+                Some(&tags),
             )
             .map_err(from_anyhow_error)?;
 
         let cb = match cb {
-            Some(cb) => Some(env.create_reference(cb)?),
+            Some(func) => Some(func.create_ref()?),
             None => None,
         };
 
-        Ok(FunctionResultStream::new(stream, cb, tb, client_registry))
+        let on_tick = match on_tick {
+            Some(tick_cb) => Some(tick_cb.create_ref()?),
+            None => None,
+        };
+
+        Ok(FunctionResultStream::new(
+            stream,
+            cb,
+            on_tick,
+            tb,
+            client_registry,
+        ))
     }
 
     #[napi(ts_return_type = "Promise<HTTPRequest>")]
-    pub fn build_request(
+    pub fn build_request<'e>(
         &self,
-        env: Env,
+        env: &'e Env,
         function_name: String,
-        #[napi(ts_arg_type = "{ [name: string]: any }")] args: JsObject,
+        #[napi(ts_arg_type = "{ [name: string]: any }")] args: Object,
         ctx: &RuntimeContextManager,
         tb: Option<&TypeBuilder>,
         cb: Option<&ClientRegistry>,
         stream: bool,
         env_vars: HashMap<String, String>,
-    ) -> napi::Result<JsObject> {
+    ) -> napi::Result<PromiseRaw<'e, HTTPRequest>> {
         let args = parse_ts_types::js_object_to_baml_value(env, args)?;
 
         if !args.is_map() {
@@ -341,7 +915,7 @@ impl BamlRuntime {
                 .map_err(from_anyhow_error)
         };
 
-        env.execute_tokio_future(fut, |&mut _, data| Ok(data))
+        env.spawn_future(fut)
     }
 
     #[napi]
@@ -349,14 +923,14 @@ impl BamlRuntime {
         &self,
         env: Env,
         function_name: String,
-        #[napi(ts_arg_type = "{ [name: string]: any }")] args: JsObject,
+        #[napi(ts_arg_type = "{ [name: string]: any }")] args: Object,
         ctx: &RuntimeContextManager,
         tb: Option<&TypeBuilder>,
         cb: Option<&ClientRegistry>,
         stream: bool,
         env_vars: HashMap<String, String>,
     ) -> napi::Result<HTTPRequest> {
-        let args = parse_ts_types::js_object_to_baml_value(env, args)?;
+        let args = parse_ts_types::js_object_to_baml_value(&env, args)?;
 
         if !args.is_map() {
             return Err(invalid_argument_error(&format!(
@@ -427,89 +1001,53 @@ impl BamlRuntime {
         &mut self,
         env: Env,
         #[napi(ts_arg_type = "undefined | ((err: any, param: BamlLogEvent) => void)")] func: Option<
-            JsFunction,
+            Function<LogEventCallbackArgs, ()>,
         >,
-    ) -> napi::Result<JsUndefined> {
-        let prev = self.callback.take();
-        if let Some(mut old_cb) = prev {
-            old_cb.unref(env)?;
-        }
+    ) -> napi::Result<Undefined> {
+        // drop any previous callback automatically
         self.callback = match func {
-            Some(func) => Some(env.create_reference(func)?),
+            Some(f) => Some(f.create_ref()?),
             None => None,
         };
 
-        let res = match &self.callback {
-            Some(callback_ref) => {
-                let cb = env.get_reference_value::<JsFunction>(callback_ref)?;
-                let mut tsfn = env.create_threadsafe_function(
-                    &cb,
-                    0,
-                    |ctx: ThreadSafeCallContext<BamlLogEvent>| Ok(vec![ctx.value]),
-                )?;
-                let tsfn_clone = tsfn.clone();
-
-                let cb = Box::new(move |event: LogEvent| {
-                    // let env = callback.env;
-                    let event = BamlLogEvent {
-                        metadata: LogEventMetadata {
-                            event_id: event.metadata.event_id,
-                            parent_id: event.metadata.parent_id,
-                            root_event_id: event.metadata.root_event_id,
-                        },
-                        prompt: event.prompt,
-                        raw_output: event.raw_output,
-                        parsed_output: event.parsed_output,
-                        start_time: event.start_time,
-                    };
-
-                    let res = tsfn_clone.call(Ok(event), ThreadsafeFunctionCallMode::Blocking);
-                    if res != napi::Status::Ok {
-                        log::error!("Error calling on_log_event callback: {res:?}");
-                    }
-
-                    Ok(())
-                });
-
-                let res = self
-                    .inner
-                    .set_log_event_callback(Some(cb))
-                    .map_err(from_anyhow_error);
-                let _ = tsfn.unref(&env);
-
-                match res {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        log::error!("Error setting log_event_callback: {e:?}");
-                        Err(e)
-                    }
-                }
-            }
-            None => {
-                let res = self
-                    .inner
-                    .set_log_event_callback(None)
-                    .map_err(from_anyhow_error);
-
-                match res {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        log::error!("Error setting log_event_callback: {e:?}");
-                        Err(e)
-                    }
-                }
-            }
+        let Some(cb_ref) = &self.callback else {
+            return self
+                .inner
+                .set_log_event_callback(None)
+                .map_err(from_anyhow_error);
         };
 
-        let _ = match res {
-            Ok(_) => Ok(env.get_undefined()?),
-            Err(e) => {
-                log::error!("Error setting log_event_callback: {e:?}");
-                Err(e)
-            }
-        };
+        // configure runtime callback
+        let cb = cb_ref.borrow_back(&env)?;
+        let thread_safe_fn = cb.build_threadsafe_function().build_callback(
+            |ctx: ThreadSafeCallContext<(Option<Error>, BamlLogEvent)>| {
+                Ok(FnArgs::from((Option::<Error>::None, ctx.value)))
+            },
+        )?;
 
-        env.get_undefined()
+        let rust_cb = Box::new(move |event: LogEvent| {
+            let js_evt = BamlLogEvent {
+                metadata: LogEventMetadata {
+                    event_id: event.metadata.event_id,
+                    parent_id: event.metadata.parent_id,
+                    root_event_id: event.metadata.root_event_id,
+                },
+                prompt: event.prompt,
+                raw_output: event.raw_output,
+                parsed_output: event.parsed_output,
+                start_time: event.start_time,
+            };
+
+            let status = thread_safe_fn.call((None, js_evt), ThreadsafeFunctionCallMode::Blocking);
+            if status != napi::Status::Ok {
+                log::error!("Error calling log_event callback: {status:?}");
+            }
+            Ok(())
+        });
+
+        self.inner
+            .set_log_event_callback(Some(rust_cb))
+            .map_err(from_anyhow_error)
     }
 
     #[napi]
@@ -523,14 +1061,12 @@ impl BamlRuntime {
     }
 }
 
+// TODO: This is probably no longer necessary since dropping FunctionRef
+// automatically unrefs the Node callback. Fix the macro that creates the
+// wrapper to remove custom_finalize.
 impl ObjectFinalize for BamlRuntime {
-    fn finalize(mut self, env: Env) -> napi::Result<()> {
-        if let Some(mut cb) = self.callback.take() {
-            match cb.unref(env) {
-                Ok(_) => (),
-                Err(e) => log::error!("Error unrefing callback: {e:?}"),
-            }
-        }
+    fn finalize(self, _env: Env) -> napi::Result<()> {
+        // dropping self also drops any FunctionRef callbacks
         Ok(())
     }
 }

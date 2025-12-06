@@ -9,7 +9,7 @@ use super::{
     parse_types::{parse_field_type, reassociate_union_attributes},
     Rule,
 };
-use crate::ast::*;
+use crate::{ast::*, parser::parse_expression::parse_config_expression};
 
 pub(crate) fn parse_value_expr(
     model_name: &Option<Identifier>,
@@ -22,7 +22,8 @@ pub(crate) fn parse_value_expr(
     let mut name: Option<Identifier> = None;
     let mut attributes: Vec<Attribute> = Vec::new();
     let mut field_type = None;
-    let mut comment: Option<Comment> = block_comment.and_then(parse_comment_block);
+    let mut comment: Option<Comment> =
+        block_comment.and_then(|c| parse_comment_block(c, diagnostics));
 
     for current in pair.into_inner() {
         match current.as_rule() {
@@ -31,7 +32,7 @@ pub(crate) fn parse_value_expr(
                 attributes.push(parse_attribute(current, false, diagnostics));
             }
             Rule::trailing_comment => {
-                comment = match (comment, parse_trailing_comment(current)) {
+                comment = match (comment, parse_trailing_comment(current, diagnostics)) {
                     (c, None) | (None, c) => c,
                     (Some(existing), Some(new)) => Some(Comment {
                         text: [existing.text, new.text].join("\n"),
@@ -39,8 +40,11 @@ pub(crate) fn parse_value_expr(
                 };
             }
             Rule::expression => field_type = Some(parse_expression(current, diagnostics)),
+            Rule::config_expression => {
+                field_type = Some(parse_config_expression(current, diagnostics))
+            }
 
-            _ => parsing_catch_all(current, "field"),
+            _ => parsing_catch_all(current, "field", diagnostics),
         }
     }
 
@@ -94,7 +98,8 @@ pub(crate) fn parse_type_expr(
     let mut name: Option<Identifier> = None;
     let mut field_attributes = Vec::<Attribute>::new();
     let mut field_type = None;
-    let mut comment: Option<Comment> = block_comment.and_then(parse_comment_block);
+    let mut comment: Option<Comment> =
+        block_comment.and_then(|c| parse_comment_block(c, diagnostics));
 
     for current in pair.into_inner() {
         match current.as_rule() {
@@ -102,7 +107,7 @@ pub(crate) fn parse_type_expr(
                 name = Some(parse_identifier(current, diagnostics));
             }
             Rule::trailing_comment => {
-                comment = merge_comments(comment, parse_trailing_comment(current));
+                comment = merge_comments(comment, parse_trailing_comment(current, diagnostics));
             }
             Rule::field_type_chain => {
                 field_type = parse_field_type_chain(current, diagnostics);
@@ -111,7 +116,7 @@ pub(crate) fn parse_type_expr(
                 let attribute = parse_attribute(current, false, diagnostics);
                 field_attributes.push(attribute);
             }
-            _ => parsing_catch_all(current, "field"),
+            _ => parsing_catch_all(current, "field", diagnostics),
         }
     }
 
@@ -201,7 +206,7 @@ pub(crate) fn parse_field_type_with_attr(
             }
             Rule::trailing_comment => {}
             _ => {
-                parsing_catch_all(current, "field_type_with_attr!");
+                parsing_catch_all(current, "field_type_with_attr!", diagnostics);
             }
         }
     }

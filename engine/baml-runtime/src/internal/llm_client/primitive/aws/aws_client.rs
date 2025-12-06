@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ops::Deref, sync::Arc, time::Duration};
+use std::{borrow::Cow, collections::HashMap, ops::Deref, sync::Arc};
 
 use anyhow::{Context, Result};
 use aws_config::{
@@ -7,7 +7,8 @@ use aws_config::{
 use aws_credential_types::{
     provider::{
         error::{CredentialsError, CredentialsNotLoaded},
-        future::ProvideCredentials,
+        future::ProvideCredentials as ProvideCredentialsFuture,
+        ProvideCredentials,
     },
     Credentials,
 };
@@ -15,12 +16,13 @@ use aws_sdk_bedrockruntime::{
     self as bedrock,
     config::{Intercept, StalledStreamProtectionConfig},
     operation::converse::ConverseOutput,
+    types::CitationsConfig,
     Client as BedrockRuntimeClient,
 };
 use aws_smithy_json::serialize::JsonObjectWriter;
 use aws_smithy_runtime_api::{client::result::SdkError, http::Headers};
 use aws_smithy_types::{Blob, Document};
-use baml_ids::HttpRequestId;
+use baml_ids::{FunctionCallId, HttpRequestId};
 use baml_types::{
     tracing::events::{
         ClientDetails, HTTPBody, HTTPRequest, HTTPResponse, HTTPResponseStream, SSEEvent,
@@ -35,9 +37,12 @@ use internal_llm_client::{
     aws_bedrock::{self, ResolvedAwsBedrock},
     AllowedRoleMetadata, ClientProvider, ResolvedClientProperty, UnresolvedClientProperty,
 };
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::{json, Map};
+use shell_escape::escape;
+use url::Url;
 use uuid::Uuid;
 use web_time::{Instant, SystemTime};
 
@@ -62,6 +67,71 @@ use crate::{
     JsonBodyInput, RenderCurlSettings, RuntimeContext,
 };
 
+// Strip the MIME type prefix ("type/subtype" -> "subtype").
+fn strip_mime_prefix(mime: &str) -> &str {
+    mime.split_once('/').map(|(_, s)| s).unwrap_or(mime)
+}
+
+fn media_to_content_block_json(media: &BamlMedia) -> Result<serde_json::Value> {
+    let content_block = {
+        let mut obj = Map::new();
+        if let Some(mime) = media.mime_type.as_deref() {
+            obj.insert("format".into(), json!(strip_mime_prefix(mime)));
+        }
+        let source = match &media.content {
+            BamlMediaContent::File(media_file) => todo!(),
+            BamlMediaContent::Url(url) => {
+                let parsed = Url::parse(&url.url).with_context(|| {
+                    format!("Invalid S3 URI for AWS Bedrock video source: {url}")
+                })?;
+
+                if parsed.scheme() != "s3" {
+                    anyhow::bail!("AWS Bedrock requires s3:// URIs, but got: {}", url.url);
+                }
+
+                // unimplemented!("make sure the test works")
+                json!({
+                    "s3Location": {
+                        "uri": url.url,
+                    }
+                })
+            }
+            BamlMediaContent::Base64(base64) => json!({
+                "bytes": base64.base64,
+            }),
+        };
+        obj.insert("source".into(), source);
+        obj
+    };
+    match media.media_type {
+        // _ => anyhow::bail!("AWS Bedrock only supports base64 image inputs in modular requests"),
+        BamlMediaType::Image => Ok(json!({ "image": content_block })),
+        BamlMediaType::Pdf => {
+            let mut content_block = content_block;
+            content_block.insert("name".into(), json!("document"));
+            Ok(json!({ "document": content_block }))
+        }
+        BamlMediaType::Video => Ok(json!({ "video": content_block })),
+        BamlMediaType::Audio => Ok(json!({ "audio": content_block })),
+    }
+}
+
+fn system_part_to_json(part: &ChatMessagePart) -> Result<serde_json::Value> {
+    match part {
+        ChatMessagePart::Text(t) => Ok(json!({ "text": t })),
+        ChatMessagePart::WithMeta(p, _) => system_part_to_json(p),
+        other => anyhow::bail!("AWS Bedrock only supports text system blocks, but got {other:?}"),
+    }
+}
+
+fn chat_part_to_json(part: &ChatMessagePart) -> Result<serde_json::Value> {
+    match part {
+        ChatMessagePart::Text(t) => Ok(json!({ "text": t })),
+        ChatMessagePart::Media(media) => media_to_content_block_json(media),
+        ChatMessagePart::WithMeta(inner, _) => chat_part_to_json(inner),
+    }
+}
+
 // represents client that interacts with the Bedrock API
 pub struct AwsClient {
     pub name: String,
@@ -70,6 +140,12 @@ pub struct AwsClient {
     features: ModelFeatures,
     properties: ResolvedAwsBedrock,
 }
+
+const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
 
 fn resolve_properties(
     provider: &ClientProvider,
@@ -187,6 +263,7 @@ impl aws_smithy_runtime_api::client::interceptors::Intercept for CollectorInterc
             request.method().to_string(),
             headers,
             HTTPBody::new(request.body().bytes().unwrap_or_default().to_vec()),
+            self.client_details.clone(),
         );
         let call_stack = self.call_stack.clone();
         let request = Arc::new(request);
@@ -230,13 +307,11 @@ struct ExplicitCredentialsProvider {
 }
 
 impl aws_credential_types::provider::ProvideCredentials for ExplicitCredentialsProvider {
-    fn provide_credentials<'a>(
-        &'a self,
-    ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+    fn provide_credentials<'a>(&'a self) -> ProvideCredentialsFuture<'a>
     where
         Self: 'a,
     {
-        ProvideCredentials::ready(match (&self.access_key_id, &self.secret_access_key, &self.session_token) {
+        ProvideCredentialsFuture::ready(match (&self.access_key_id, &self.secret_access_key, &self.session_token) {
             (None, None, None) => {
                 Err(CredentialsError::unhandled("BAML internal error: ExplicitCredentialsProvider should only be constructed if either access_key_id or secret_access_key are provided"))
             }
@@ -254,6 +329,123 @@ impl aws_credential_types::provider::ProvideCredentials for ExplicitCredentialsP
 }
 
 impl AwsClient {
+    fn build_converse_body_json(
+        &self,
+        prompt: &[RenderedChatMessage],
+    ) -> Result<serde_json::Map<String, serde_json::Value>> {
+        let mut system_blocks: Option<Vec<serde_json::Value>> = None;
+        let mut chat_slice = prompt;
+
+        if let Some((first, remainder)) = chat_slice.split_first() {
+            if first.role == "system" {
+                let mut blocks = Vec::new();
+                for part in &first.parts {
+                    blocks.push(system_part_to_json(part)?);
+                }
+                system_blocks = Some(blocks);
+                chat_slice = remainder;
+            }
+        }
+
+        let mut messages_json: Vec<serde_json::Value> = Vec::new();
+        for message in chat_slice {
+            let mut content_blocks = Vec::new();
+            for part in &message.parts {
+                content_blocks.push(chat_part_to_json(part)?);
+            }
+            messages_json.push(json!({
+                "role": message.role,
+                "content": content_blocks,
+            }));
+        }
+
+        let mut root = serde_json::Map::new();
+        root.insert("messages".into(), serde_json::Value::Array(messages_json));
+
+        if let Some(system) = system_blocks {
+            root.insert("system".into(), serde_json::Value::Array(system));
+        }
+
+        if let Some(cfg) = &self.properties.inference_config {
+            let mut map = serde_json::Map::new();
+            if let Some(v) = cfg.max_tokens {
+                map.insert("maxTokens".into(), json!(v));
+            }
+            if let Some(v) = cfg.temperature {
+                map.insert("temperature".into(), json!(v));
+            }
+            if let Some(v) = cfg.top_p {
+                map.insert("topP".into(), json!(v));
+            }
+            if let Some(v) = cfg.stop_sequences.as_ref() {
+                map.insert("stopSequences".into(), json!(v));
+            }
+            if !map.is_empty() {
+                root.insert("inferenceConfig".into(), serde_json::Value::Object(map));
+            }
+        }
+
+        if !self.properties.additional_model_request_fields.is_empty() {
+            let addl = serde_json::to_value(&self.properties.additional_model_request_fields)?;
+            root.insert("additionalModelRequestFields".into(), addl);
+        }
+
+        Ok(root)
+    }
+
+    pub async fn build_modular_http_request(
+        &self,
+        ctx: &RuntimeContext,
+        chat_messages: &[RenderedChatMessage],
+        stream: bool,
+        request_id: HttpRequestId,
+    ) -> Result<HTTPRequest> {
+        if stream {
+            anyhow::bail!(
+                "AWS Bedrock modular streaming is not supported. Use non-streaming modular requests."
+            );
+        }
+
+        let region = self.properties.region.clone().unwrap_or_else(|| {
+            ctx.env_vars()
+                .get("AWS_REGION")
+                .cloned()
+                .unwrap_or_default()
+        });
+
+        if region.is_empty() {
+            anyhow::bail!(
+                "AWS region is required to build modular request. Set it in the client options or via AWS_REGION."
+            );
+        }
+
+        let body_string = serde_json::to_string(&serde_json::Value::Object(
+            self.build_converse_body_json(chat_messages)?,
+        ))?;
+        let body_bytes = body_string.as_bytes().to_vec();
+
+        let host = format!("bedrock-runtime.{region}.amazonaws.com");
+        let encoded_model =
+            utf8_percent_encode(&self.properties.model, PATH_SEGMENT_ENCODE_SET).to_string();
+        let url = format!("https://{host}/model/{encoded_model}/converse");
+
+        let mut header_map = HashMap::new();
+        header_map.insert("content-type".to_string(), "application/json".to_string());
+        header_map.insert("accept".to_string(), "application/json".to_string());
+
+        Ok(HTTPRequest::new(
+            request_id,
+            url,
+            "POST".to_string(),
+            header_map,
+            HTTPBody::new(body_bytes),
+            ClientDetails {
+                name: self.context.name.clone(),
+                provider: "aws-bedrock".to_string(),
+                options: self.properties.client_options(),
+            },
+        ))
+    }
     pub fn dynamic_new(client: &ClientProperty, ctx: &RuntimeContext) -> Result<AwsClient> {
         let properties = resolve_properties(&client.provider, &client.unresolved_options()?, ctx)?;
 
@@ -265,15 +457,32 @@ impl AwsClient {
                 default_role: properties.default_role(),
                 allowed_roles: properties.allowed_roles(),
                 options: properties.client_options(),
+                remap_role: properties.remap_role(),
             },
             features: ModelFeatures {
                 chat: true,
                 completion: false,
                 max_one_system_prompt: true,
-                resolve_audio_urls: ResolveMediaUrls::Always,
-                resolve_image_urls: ResolveMediaUrls::Always,
-                resolve_pdf_urls: ResolveMediaUrls::Always,
-                resolve_video_urls: ResolveMediaUrls::Never,
+                resolve_audio_urls: properties
+                    .media_url_handler
+                    .audio
+                    .map(Into::into)
+                    .unwrap_or(ResolveMediaUrls::SendBase64),
+                resolve_image_urls: properties
+                    .media_url_handler
+                    .images
+                    .map(Into::into)
+                    .unwrap_or(ResolveMediaUrls::SendBase64),
+                resolve_pdf_urls: properties
+                    .media_url_handler
+                    .pdf
+                    .map(Into::into)
+                    .unwrap_or(ResolveMediaUrls::SendBase64),
+                resolve_video_urls: properties
+                    .media_url_handler
+                    .video
+                    .map(Into::into)
+                    .unwrap_or(ResolveMediaUrls::SendUrl),
                 allowed_metadata: properties.allowed_role_metadata.clone(),
             },
             retry_policy: client.retry_policy.as_ref().map(String::to_owned),
@@ -292,15 +501,32 @@ impl AwsClient {
                 default_role: properties.default_role(),
                 allowed_roles: properties.allowed_roles(),
                 options: properties.client_options(),
+                remap_role: properties.remap_role(),
             },
             features: ModelFeatures {
                 chat: true,
                 completion: false,
                 max_one_system_prompt: true,
-                resolve_audio_urls: ResolveMediaUrls::Always,
-                resolve_image_urls: ResolveMediaUrls::Always,
-                resolve_pdf_urls: ResolveMediaUrls::Always,
-                resolve_video_urls: ResolveMediaUrls::Never,
+                resolve_audio_urls: properties
+                    .media_url_handler
+                    .audio
+                    .map(Into::into)
+                    .unwrap_or(ResolveMediaUrls::SendBase64),
+                resolve_image_urls: properties
+                    .media_url_handler
+                    .images
+                    .map(Into::into)
+                    .unwrap_or(ResolveMediaUrls::SendBase64),
+                resolve_pdf_urls: properties
+                    .media_url_handler
+                    .pdf
+                    .map(Into::into)
+                    .unwrap_or(ResolveMediaUrls::SendBase64),
+                resolve_video_urls: properties
+                    .media_url_handler
+                    .video
+                    .map(Into::into)
+                    .unwrap_or(ResolveMediaUrls::SendUrl),
                 allowed_metadata: properties.allowed_role_metadata.clone(),
             },
             retry_policy: client.elem().retry_policy_id.as_ref().map(String::to_owned),
@@ -313,6 +539,10 @@ impl AwsClient {
         static DEFAULT_REQUEST_OPTIONS: std::sync::OnceLock<BamlMap<String, serde_json::Value>> =
             std::sync::OnceLock::new();
         DEFAULT_REQUEST_OPTIONS.get_or_init(Default::default)
+    }
+
+    pub fn http_config(&self) -> &internal_llm_client::HttpConfig {
+        &self.properties.http_config
     }
 
     // TODO: this should be memoized on client construction, but because config loading is async,
@@ -403,7 +633,7 @@ impl AwsClient {
         let config = loader.load().await;
         let http_client = custom_http_client::client()?;
 
-        let bedrock_config = aws_sdk_bedrockruntime::config::Builder::from(&config)
+        let mut bedrock_config = aws_sdk_bedrockruntime::config::Builder::from(&config)
             // To support HTTPS_PROXY https://github.com/awslabs/aws-sdk-rust/issues/169
             .http_client(http_client)
             // Adding a custom http client (above) breaks the stalled stream protection for some reason. If a bedrock request takes longer than 5s (the default grace period, it makes it error out), so we disable it.
@@ -412,9 +642,14 @@ impl AwsClient {
                 call_stack,
                 http_request_id.clone(),
                 &self.properties,
-            ))
-            .build();
-        Ok(BedrockRuntimeClient::from_conf(bedrock_config))
+            ));
+
+        // Set endpoint_url if specified
+        if let Some(endpoint_url) = self.properties.endpoint_url.as_ref() {
+            bedrock_config = bedrock_config.endpoint_url(endpoint_url);
+        }
+
+        Ok(BedrockRuntimeClient::from_conf(bedrock_config.build()))
     }
 
     async fn chat_anyhow(&self, response: &ConverseOutput) -> Result<String> {
@@ -543,18 +778,35 @@ impl WithRenderRawCurl for AwsClient {
         &self,
         ctx: &RuntimeContext,
         prompt: &[internal_baml_jinja::RenderedChatMessage],
-        _render_settings: RenderCurlSettings,
+        render_settings: RenderCurlSettings,
     ) -> Result<String> {
-        let converse_input = self.build_request(ctx, prompt)?;
+        // Build CLI command
+        let mut cmd = vec![];
+        if let Some(region) = &self.properties.region {
+            cmd.push(format!("AWS_REGION={region}"));
+        }
+        if let Some(profile) = &self.properties.profile {
+            cmd.push(format!(" AWS_PROFILE={profile}"));
+        }
+        let base_cmd = if render_settings.stream && self.supports_streaming() {
+            "aws bedrock-runtime converse-stream"
+        } else {
+            "aws bedrock-runtime converse"
+        };
+        cmd.push(base_cmd.to_string());
 
-        // TODO(sam): this is fucked up. The SDK actually hides all the serializers inside the crate and doesn't let the user access them.
+        cmd.push(format!("--model-id '{}'", self.properties.model));
+        cmd.push("--output json".to_string());
 
-        Ok(format!(
-            "Note, this is not yet complete!\n\nSee: https://docs.aws.amazon.com/cli/latest/reference/bedrock-runtime/converse.html\n\naws bedrock converse --model-id {} --messages {} {}",
-            converse_input.model_id.unwrap_or("<model_id>".to_string()),
-            "<messages>",
-            "TODO"
-        ))
+        // Build --cli-input-json payload
+        let root = self.build_converse_body_json(prompt)?;
+
+        // pretty, multi-line JSON
+        let input_json_str = serde_json::to_string_pretty(&serde_json::Value::Object(root))?;
+        let input_json_escaped = escape(Cow::Borrowed(&input_json_str));
+        cmd.push(format!("--cli-input-json {input_json_escaped}"));
+
+        Ok(cmd.join(" "))
     }
 }
 
@@ -721,6 +973,7 @@ impl WithStreamChat for AwsClient {
                         prompt_tokens: None,
                         output_tokens: None,
                         total_tokens: None,
+                        cached_input_tokens: None,
                     },
                 }),
                 response,
@@ -784,6 +1037,8 @@ impl WithStreamChat for AwsClient {
                                             Some(usage.output_tokens() as u64);
                                         new_state.metadata.total_tokens =
                                             Some((usage.total_tokens()) as u64);
+                                        // AWS Bedrock does not currently support cached tokens
+                                        new_state.metadata.cached_input_tokens = None;
                                     }
                                 }
                                 _ => {
@@ -829,36 +1084,46 @@ impl AwsClient {
         media: &baml_types::BamlMedia,
     ) -> Result<bedrock::types::ContentBlock> {
         match media.media_type {
-            BamlMediaType::Image => match &media.content {
-                BamlMediaContent::File(_) => {
-                    anyhow::bail!(
+            BamlMediaType::Image => {
+                let format = bedrock::types::ImageFormat::from(
+                    {
+                        let mime_type = media.mime_type_as_ok()?;
+                        match mime_type.strip_prefix("image/") {
+                            Some(s) => s.to_string(),
+                            None => mime_type,
+                        }
+                    }
+                    .as_str(),
+                );
+                match &media.content {
+                    BamlMediaContent::File(_) => {
+                        anyhow::bail!(
                             "BAML internal error (AWSBedrock): file should have been resolved to base64"
                         )
+                    }
+                    BamlMediaContent::Url(url) => Ok(bedrock::types::ContentBlock::Image(
+                        bedrock::types::ImageBlock::builder()
+                            .set_format(Some(format))
+                            .set_source(Some(bedrock::types::ImageSource::S3Location(
+                                bedrock::types::S3Location::builder()
+                                    .set_uri(Some(url.url.clone()))
+                                    .build()
+                                    .context("Failed to build S3Location block")?,
+                            )))
+                            .build()
+                            .context("Failed to build Image block")?,
+                    )),
+                    BamlMediaContent::Base64(b64_media) => Ok(bedrock::types::ContentBlock::Image(
+                        bedrock::types::ImageBlock::builder()
+                            .set_format(Some(format))
+                            .set_source(Some(bedrock::types::ImageSource::Bytes(Blob::new(
+                                aws_smithy_types::base64::decode(b64_media.base64.clone())?,
+                            ))))
+                            .build()
+                            .context("Failed to build image block")?,
+                    )),
                 }
-                BamlMediaContent::Url(_) => {
-                    anyhow::bail!(
-                            "BAML internal error (AWSBedrock): media URL should have been resolved to base64"
-                        )
-                }
-                BamlMediaContent::Base64(b64_media) => Ok(bedrock::types::ContentBlock::Image(
-                    bedrock::types::ImageBlock::builder()
-                        .set_format(Some(bedrock::types::ImageFormat::from(
-                            {
-                                let mime_type = media.mime_type_as_ok()?;
-                                match mime_type.strip_prefix("image/") {
-                                    Some(s) => s.to_string(),
-                                    None => mime_type,
-                                }
-                            }
-                            .as_str(),
-                        )))
-                        .set_source(Some(bedrock::types::ImageSource::Bytes(Blob::new(
-                            aws_smithy_types::base64::decode(b64_media.base64.clone())?,
-                        ))))
-                        .build()
-                        .context("Failed to build image block")?,
-                )),
-            },
+            }
             BamlMediaType::Pdf => {
                 match &media.content {
                     BamlMediaContent::File(_) => {
@@ -871,10 +1136,13 @@ impl AwsClient {
                         Ok(bedrock::types::ContentBlock::Document(
                             bedrock::types::DocumentBlock::builder()
                                 .set_format(Some(bedrock::types::DocumentFormat::Pdf))
-                                .set_name(Some("document.pdf".to_string())) // Default name for URL-based Pdfs
+                                .set_name(Some("document".to_string())) // Default name for URL-based Pdfs
                                 .set_source(Some(bedrock::types::DocumentSource::Bytes(Blob::new(
                                     url_media.url.as_bytes().to_vec(),
                                 ))))
+                                .set_citations(Some(
+                                    CitationsConfig::builder().set_enabled(Some(true)).build()?,
+                                ))
                                 .build()
                                 .context("Failed to build Pdf document block")?,
                         ))
@@ -884,7 +1152,7 @@ impl AwsClient {
                         Ok(bedrock::types::ContentBlock::Document(
                             bedrock::types::DocumentBlock::builder()
                                 .set_format(Some(bedrock::types::DocumentFormat::Pdf))
-                                .set_name(Some("document.pdf".to_string())) // Default name for Base64 Pdfs
+                                .set_name(Some("document".to_string())) // Default name for Base64 Pdfs
                                 .set_source(Some(bedrock::types::DocumentSource::Bytes(Blob::new(
                                     aws_smithy_types::base64::decode(b64_media.base64.clone())?,
                                 ))))
@@ -895,46 +1163,44 @@ impl AwsClient {
                 }
             }
             BamlMediaType::Video => {
+                let format = bedrock::types::VideoFormat::from(
+                    {
+                        let mime_type = media.mime_type_as_ok()?;
+                        match mime_type.strip_prefix("video/") {
+                            Some(s) => s.to_string(),
+                            None => mime_type,
+                        }
+                    }
+                    .as_str(),
+                );
+                // AWS Bedrock supports video for Nova models with specific format
                 match &media.content {
                     BamlMediaContent::File(_) => {
                         anyhow::bail!(
                             "BAML internal error (AWSBedrock): video file should have been resolved to base64"
                         )
                     }
-                    BamlMediaContent::Url(_) => {
-                        anyhow::bail!(
-                            "BAML internal error (AWSBedrock): video URL should have been resolved to base64"
-                        )
-                    }
-                    BamlMediaContent::Base64(b64_media) => {
-                        // AWS Bedrock supports video for Nova models with specific format
-                        let mime_type = media.mime_type_as_ok()?;
-                        let format = match mime_type.as_str() {
-                            "video/mp4" => bedrock::types::VideoFormat::Mp4,
-                            "video/mpeg" => bedrock::types::VideoFormat::Mpeg,
-                            "video/mov" => bedrock::types::VideoFormat::Mov,
-                            // "video/avi" => bedrock::types::VideoFormat::Avi,
-                            "video/x-flv" => bedrock::types::VideoFormat::Flv,
-                            "video/mkv" => bedrock::types::VideoFormat::Mkv,
-                            "video/webm" => bedrock::types::VideoFormat::Webm,
-                            _ => {
-                                anyhow::bail!(
-                                    "AWS Bedrock video format not supported: {}. Supported formats: mp4, mpeg, mov, flv, mkv, webm",
-                                    mime_type
-                                );
-                            }
-                        };
-
-                        Ok(bedrock::types::ContentBlock::Video(
-                            bedrock::types::VideoBlock::builder()
-                                .set_format(Some(format))
-                                .set_source(Some(bedrock::types::VideoSource::Bytes(Blob::new(
-                                    aws_smithy_types::base64::decode(b64_media.base64.clone())?,
-                                ))))
-                                .build()
-                                .context("Failed to build video block")?,
-                        ))
-                    }
+                    BamlMediaContent::Url(url) => Ok(bedrock::types::ContentBlock::Video(
+                        bedrock::types::VideoBlock::builder()
+                            .set_format(Some(format))
+                            .set_source(Some(bedrock::types::VideoSource::S3Location(
+                                bedrock::types::S3Location::builder()
+                                    .set_uri(Some(url.url.clone()))
+                                    .build()
+                                    .context("Failed to build S3Location block")?,
+                            )))
+                            .build()
+                            .context("Failed to build Video document block")?,
+                    )),
+                    BamlMediaContent::Base64(b64_media) => Ok(bedrock::types::ContentBlock::Video(
+                        bedrock::types::VideoBlock::builder()
+                            .set_format(Some(format))
+                            .set_source(Some(bedrock::types::VideoSource::Bytes(Blob::new(
+                                aws_smithy_types::base64::decode(b64_media.base64.clone())?,
+                            ))))
+                            .build()
+                            .context("AWS Bedrock error: mime_type must be explicitly set on base64 videos")?,
+                    )),
                 }
             }
             BamlMediaType::Audio => {
@@ -1125,6 +1391,7 @@ impl WithChat for AwsClient {
                         .usage
                         .as_ref()
                         .and_then(|i| i.total_tokens.try_into().ok()),
+                    cached_input_tokens: None, // AWS Bedrock does not currently support cached tokens
                 },
             }),
             Err(e) => LLMResponse::LLMFailure(LLMErrorResponse {

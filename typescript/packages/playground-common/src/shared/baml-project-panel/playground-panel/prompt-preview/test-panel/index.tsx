@@ -1,3 +1,4 @@
+'use client';
 import { ScrollArea } from '@baml/ui/scroll-area';
 /* eslint-disable @typescript-eslint/no-floating-promises */
 import { useAtom, useAtomValue } from 'jotai';
@@ -77,7 +78,7 @@ export const TestPanel = () => {
           fallback={<div>Error rendering view</div>}
           onReset={() => {
             // Reset any state that may have caused the error
-            window.location.reload();
+            // window.location.reload();
           }}
           resetKeys={[viewType, currentRun?.timestamp]}
         >
